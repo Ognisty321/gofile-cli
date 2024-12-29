@@ -57,7 +57,8 @@ This repository contains a **Bash CLI script** (`gofile.sh`) that interacts with
 
 1. **Clone** this repository:
    ```bash
-   git clone https://github.com/Ognisty321/gofile-cli.git (or your username if forked)
+   git clone https://github.com/Ognisty321/gofile-cli.git
+   # or your username if forked
    cd gofile-cli
    ```
 
