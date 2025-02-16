@@ -6,7 +6,7 @@
     This script provides functionality equivalent to the original Bash script (gofile.sh),
     adapted for Windows PowerShell.
 
-    Requires PowerShell 5+ (or PowerShell Core).
+    Requires PowerShell 7+.
 
 #>
 
