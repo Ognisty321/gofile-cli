@@ -1,6 +1,8 @@
-## Gofile CLI
+# Gofile CLI (Bash)
 
-This repository contains a **Bash CLI script** (`gofile.sh`) that interacts with the [Gofile.io API](https://gofile.io). It allows you to upload files, create folders, update content, manage direct links, and more—all from the command line.  
+A simple but robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), manage folders/contents, search, create direct links, and handle account actions, straight from your terminal.
+
+> Uploads default to Gofile’s **global upload endpoint**, and the CLI can reuse the returned `folderId`/`guestToken` to keep multiple uploads in the same folder automatically.
 
 ---
 
@@ -11,426 +13,273 @@ This repository contains a **Bash CLI script** (`gofile.sh`) that interacts with
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+  - [Global Options](#global-options)
   - [Commands](#commands)
-  - [Examples](#examples)
+- [Examples](#examples)
 - [License](#license)
 
 ---
 
 ## Features
 
-- **Store and manage your Gofile API Token**:  
-  Easily save your token in a config file (`~/.config/gofile-cli/config`) without hardcoding it.
+- **Token management**
+  - Store your token in `~/.config/gofile-cli/config` (XDG-aware).
+  - Support for `--token` (per-command override) and `GOFILE_TOKEN` env var.
+  - `show-token` prints a **masked** token.
 
-- **Upload files**:  
-  Upload any file to Gofile, either to a new public folder or to an existing folder in your account.
+- **Guest mode**
+  - Run commands without auth via `--guest` (useful for basic uploads / public operations).
 
-- **Create and manage folders**:  
-  Create subfolders in your Gofile account, set folder attributes (name, public, expiry date, etc.).
+- **Smarter uploads**
+  - Uses Gofile’s **global upload endpoint** by default.
+  - Upload **multiple files** in one command; if you don’t pass `--folder`, the CLI reuses the folder returned by the first upload.
+  - Optional `--progress` for a progress bar.
+  - Optional server selection by `--zone eu|na` or `--server storeX` (legacy-style).
 
-- **Retrieve account and folder info**:  
-  Fetch details about your account, list contents of folders, and manage them from the CLI.
+- **More ergonomic commands**
+  - `ls` prints a human-friendly listing of a folder.
+  - Aliases: `servers`, `mkdir`, `rm`, `search`.
 
-- **Search**:  
-  Search for files/folders by name or tags within a specified folder.
+- **Password hashing support**
+  - Some API endpoints accept/require a **SHA-256 hex password hash**; the CLI supports `--password` (hashes for you) and `--password-hash` (use your own).
+  - Helper command: `hash-password`.
 
-- **Direct links**:  
-  Create/update/delete direct links for files or folders ( ZIP for folder downloads ) with optional password protection, IP/domain restrictions, and expiry times.
+- **Direct links improvements**
+  - Create/update direct links with IP/domain allowlists, auth pairs, **and domainsBlocked**.
 
-- **Copy, move, and import content**:  
-  Restructure your Gofile account contents by copying/moving to different folders—or import public content into your own root.
-
-- **Reset your token**:  
-  Invalidate your current token and receive a new one if necessary.
+- **Better output and error handling**
+  - Default pretty JSON output; switch to raw/compact when needed.
+  - Fails clearly on HTTP/API errors.
 
 ---
 
 ## Requirements
 
-1. **Bash** (tested on Linux; Windows under WSL should also work).
-2. [**curl**](https://curl.se/) for making HTTP requests.
-3. [**jq**](https://stedolan.github.io/jq/) for parsing JSON in the script.
+1. **Bash** (Linux; macOS and WSL typically work too)
+2. **curl**
+3. **jq**
+4. For password hashing (one of):
+   - `sha256sum` (GNU), or `shasum` (macOS), or `openssl`
 
 ---
 
 ## Installation
 
-1. **Clone** this repository:
+1. Clone this repository:
    ```bash
    git clone https://github.com/Ognisty321/gofile-cli.git
-   # or your username if forked
    cd gofile-cli
    ```
 
-2. **Make the script executable**:
+2. Make the script executable:
+
    ```bash
    chmod +x gofile.sh
    ```
 
-3. **(Optional)** Copy or symlink `gofile.sh` to a directory in your `PATH`:
+3. (Optional) Put it on your PATH:
+
    ```bash
    sudo cp gofile.sh /usr/local/bin/gofile
-   # Or create a symlink:
-   # ln -s /path/to/gofile.sh /usr/local/bin/gofile
+   # or:
+   # ln -s "$PWD/gofile.sh" /usr/local/bin/gofile
    ```
 
-Now you can run `./gofile.sh` (or just `gofile` if it’s in your `PATH`).
+Now you can run `./gofile.sh` (or `gofile` if it’s in your PATH).
 
 ---
 
 ## Configuration
 
-1. **Set your Gofile.io API Token**:
-   ```bash
-   ./gofile.sh set-token <YOUR_API_TOKEN>
-   ```
-   This creates (or updates) a config file in `~/.config/gofile-cli/config`:
-   ```
-   API_TOKEN=abc123def456
-   ```
+### Set your token (recommended)
 
-2. **Verify** that your token is stored:
-   ```bash
-   ./gofile.sh show-token
-   ```
+```bash
+./gofile.sh set-token <YOUR_API_TOKEN>
+./gofile.sh show-token
+```
+
+Config file location (XDG-aware):
+
+* Default: `~/.config/gofile-cli/config`
+
+### Alternative: environment variable
+
+```bash
+export GOFILE_TOKEN="<YOUR_API_TOKEN>"
+./gofile.sh get-account-id
+```
+
+### Alternative: per-command token override
+
+```bash
+./gofile.sh --token "<YOUR_API_TOKEN>" get-account-id
+```
+
+### Remove token from config
+
+```bash
+./gofile.sh unset-token
+```
 
 ---
 
 ## Usage
 
-```plaintext
-Usage: ./gofile.sh <command> [arguments]
-
-Commands:
-  set-token <TOKEN>            
-      Save your Gofile.io API token to config
-
-  show-token                   
-      Print the currently stored API token
-
-  get-servers [zone]          
-      Get available servers. Optional zone: eu | na
-
-  upload-file <filePath> [folderId] [zoneOrServer]
-      Upload a file. 
-      - folderId: (optional) the folder ID to upload into.
-      - zoneOrServer: (optional) either "eu" or "na" for zone selection, or "storeX" for a specific server.
-
-  create-folder <parentFolderId> [folderName]
-      Create a new folder in parentFolderId (folderName optional)
-
-  update-content <contentId> <attribute> <newValue>
-      Update content attributes: name, description, tags, public, expiry, password
-
-  delete-content <contentIds>
-      Permanently delete files/folders by comma-separated IDs
-
-  get-content <contentId>
-      Retrieve detailed info about a folder (only works with folder IDs)
-
-  search-content <folderId> <searchString>
-      Search files/folders by name/tags recursively under the specified folder
-
-  create-direct-link <contentId> [expireTime] [sourceIpsAllowed] [domainsAllowed] [auth]
-      Create a direct link (for files/folders). 
-      - expireTime: Unix timestamp
-      - sourceIpsAllowed: comma-separated IPs
-      - domainsAllowed: comma-separated domains
-      - auth: comma-separated "user:pass" pairs
-
-  update-direct-link <contentId> <directLinkId> [expireTime] [sourceIpsAllowed] [domainsAllowed] [auth]
-      Update an existing direct link’s settings
-
-  delete-direct-link <contentId> <directLinkId>
-      Delete a direct link permanently
-
-  copy-content <contentsId> <destFolderId>
-      Copy multiple files/folders (comma-separated) to a new folder
-
-  move-content <contentsId> <destFolderId>
-      Move multiple files/folders (comma-separated) to a new folder
-
-  import-content <contentsId>
-      Import public content (comma-separated) to your root folder
-
-  get-account-id
-      Retrieve the account ID associated with your current token
-
-  get-account <accountId>
-      Retrieve detailed info about the specified account
-
-  reset-token <accountId>
-      Reset your current token. You’ll receive a new token via email.
+```text
+Usage:
+  ./gofile.sh [global options] <command> [args...]
 ```
+
+### Global Options
+
+* `--token <TOKEN>`: use TOKEN for this invocation (overrides config/env)
+* `--guest`: do NOT send Authorization header for this invocation
+* `-v, --verbose`: verbose output (repeat for more)
+* `--raw`: print raw JSON (no jq formatting)
+* `--compact`: print compact JSON (`jq -c`)
+* `-h, --help`: show help
 
 ---
 
-### Commands
+## Commands
 
-#### 1. **set-token**
+### Token management
 
-- **Usage**:
-  ```bash
-  ./gofile.sh set-token <YOUR_API_TOKEN>
-  ```
-- **Description**: Writes your API token to `~/.config/gofile-cli/config`.
+* `set-token <TOKEN>`
+  Save token to config
 
-#### 2. **show-token**
+* `show-token`
+  Show token (masked)
 
-- **Usage**:
-  ```bash
-  ./gofile.sh show-token
-  ```
-- **Description**: Displays the currently stored token (if any).
+* `unset-token`
+  Remove token from config
 
-#### 3. **get-servers**
+* `hash-password <PASSWORD>`
+  Print SHA-256 hex hash (useful for endpoints requiring password hashes)
 
-- **Usage**:
-  ```bash
-  # All servers (no zone filter)
-  ./gofile.sh get-servers
+---
 
-  # Only servers in 'eu' zone
-  ./gofile.sh get-servers eu
+### Servers
 
-  # Only servers in 'na' zone (may return empty if none exist)
-  ./gofile.sh get-servers na
-  ```
-- **Description**: Retrieves a list of servers. If a zone is specified, the script will post-process the response to filter servers in that zone only.  
-- **Note**: Gofile might fall back to other zones if none match the requested zone.
+* `get-servers [zone]` (alias: `servers`)
+  Get available servers. Optional zone: `eu` | `na`
 
-#### 4. **upload-file**
+---
 
-- **Usage**:
-  ```bash
-  ./gofile.sh upload-file <filePath> [folderId] [zoneOrServer]
-  ```
-  - **filePath**: Local path to the file you want to upload.
-  - **folderId** (optional): If omitted, your file uploads to a new public folder (guest mode or your default account root, depending on token).
-  - **zoneOrServer** (optional): 
-    - `eu` or `na` to automatically pick the first server from that zone. 
-    - Or specify a server name directly, e.g. `store6`.
+### Upload
 
-- **Examples**:
-  ```bash
-  # Upload a file to your default zone
-  ./gofile.sh upload-file "/path/to/video.mp4"
+* `upload <file...> [--folder <folderIdOrUrl>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--progress] [--json]`
 
-  # Upload to a specific folderId in the 'eu' zone
-  ./gofile.sh upload-file "/path/to/video.mp4" MyFolderId eu
+  Notes:
 
-  # Upload to a folder using a specific server
-  ./gofile.sh upload-file "/path/to/video.mp4" MyFolderId store6
-  ```
+  * Uses the **global upload endpoint** by default. ([gofile.io][1])
+  * If `--folder` is omitted, the CLI reuses the folder returned by the first upload when uploading multiple files.
 
-#### 5. **create-folder**
+* `upload-file <filePath> [folderId] [zoneOrServer]`
+  Backwards-compatible wrapper for older usage (prefer `upload` going forward).
 
-- **Usage**:
-  ```bash
-  ./gofile.sh create-folder <parentFolderId> [folderName]
-  ```
-- **Description**: Creates a subfolder in the specified `parentFolderId`. If `folderName` is omitted, Gofile auto-generates a folder name.
+---
 
-#### 6. **update-content**
+### Folders & contents
 
-- **Usage**:
-  ```bash
-  ./gofile.sh update-content <contentId> <attribute> <newValue>
-  ```
-- **Attributes**:
-  - `name`: Rename file/folder.
-  - `description`: Change folder description.
-  - `tags`: Comma-separated tags.
-  - `public`: `"true"` or `"false"` (folders only).
-  - `expiry`: Unix timestamp (folders only).
-  - `password`: String password (folders only).
+* `create-folder <parentFolderIdOrUrl> [folderName] [--public true|false]` (alias: `mkdir`)
+* `ls <folderIdOrUrl> [--json]`
+* `get-content <folderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
+* `search-content <folderIdOrUrl> <searchString> [--password <pw> | --password-hash <sha256hex>]` (alias: `search`)
+* `update-content <contentIdOrUrl> <attribute> <newValue>`
+* `delete-content <contentIdsCsv>` (alias: `rm`)
+* `copy-content <contentsIdCsv> <destFolderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
+* `move-content <contentsIdCsv> <destFolderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
+* `import-content <contentsIdCsv> [--password <pw> | --password-hash <sha256hex>]`
 
-#### 7. **delete-content**
+> Tip: For most commands you can pass either a **content ID** or a **share URL** like `https://gofile.io/d/AbCdEf`, the CLI extracts the ID automatically.
 
-- **Usage**:
-  ```bash
-  ./gofile.sh delete-content <contentIds>
-  ```
-- **Description**: Permanently delete one or more files/folders by passing comma-separated IDs.
+---
 
-#### 8. **get-content**
+### Direct links
 
-- **Usage**:
-  ```bash
-  ./gofile.sh get-content <folderId>
-  ```
-- **Description**: Retrieves detailed info for a folder and its contents (files/subfolders).
+* `create-direct-link <contentIdOrUrl> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
+* `update-direct-link <contentIdOrUrl> <directLinkId> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
+* `delete-direct-link <contentIdOrUrl> <directLinkId>`
 
-#### 9. **search-content**
+---
 
-- **Usage**:
-  ```bash
-  ./gofile.sh search-content <folderId> <searchString>
-  ```
-- **Description**: Recursively searches in `folderId` for files/folders matching `searchString` in name or tags.
+### Account
 
-#### 10. **create-direct-link**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh create-direct-link <contentId> [expireTime] [sourceIpsAllowed] [domainsAllowed] [auth]
-  ```
-- **Description**: Creates a direct access link to a file/folder.  
-  - `expireTime`: Unix timestamp (optional).  
-  - `sourceIpsAllowed`: Comma-separated IPs (optional).  
-  - `domainsAllowed`: Comma-separated domains (optional).  
-  - `auth`: Comma-separated `user:pass` pairs (optional).
-
-#### 11. **update-direct-link**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh update-direct-link <contentId> <directLinkId> [expireTime] [sourceIpsAllowed] [domainsAllowed] [auth]
-  ```
-- **Description**: Updates an existing direct link’s configuration.
-
-#### 12. **delete-direct-link**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh delete-direct-link <contentId> <directLinkId>
-  ```
-- **Description**: Permanently removes a direct link without deleting the underlying content.
-
-#### 13. **copy-content**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh copy-content <contentsId> <destFolderId>
-  ```
-- **Description**: Copies multiple files/folders (comma-separated) to another folder.
-
-#### 14. **move-content**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh move-content <contentsId> <destFolderId>
-  ```
-- **Description**: Moves multiple files/folders to another folder.
-
-#### 15. **import-content**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh import-content <contentsId>
-  ```
-- **Description**: Imports **public** content (by ID) into your account’s root folder.
-
-#### 16. **get-account-id**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh get-account-id
-  ```
-- **Description**: Retrieves the **account ID** associated with your current token.
-
-#### 17. **get-account**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh get-account <accountId>
-  ```
-- **Description**: Retrieves detailed information about a specific account ID.
-
-#### 18. **reset-token**
-
-- **Usage**:
-  ```bash
-  ./gofile.sh reset-token <accountId>
-  ```
-- **Description**: Immediately **invalidates** your current token and sends a new token to your Gofile-registered email.
+* `get-account-id`
+* `get-account <accountId>`
+* `whoami`
+  Prints account id + root folder id (if available)
+* `reset-token <accountId>`
+  Invalidates your token and triggers a new one (sent via Gofile email)
 
 ---
 
 ## Examples
 
-1. **Set your token and verify**:
-   ```bash
-   ./gofile.sh set-token abc123def456
-   ./gofile.sh show-token
-   ```
+### 1) Set token and check identity
 
-2. **Get servers (all, eu, or na)**:
-   ```bash
-   ./gofile.sh get-servers       # Show all possible servers
-   ./gofile.sh get-servers eu    # Show EU servers only
-   ./gofile.sh get-servers na    # Show NA servers only (might be empty)
-   ```
+```bash
+./gofile.sh set-token abc123def456
+./gofile.sh show-token
+./gofile.sh whoami
+```
 
-3. **Upload a file**:
-   ```bash
-   # Default server pick:
-   ./gofile.sh upload-file "/path/to/myvideo.mp4"
+### 2) Upload a single file (default global upload)
 
-   # Specify folder and zone:
-   ./gofile.sh upload-file "/path/to/myvideo.mp4" MyFolderId eu
+```bash
+./gofile.sh upload "/path/to/video.mp4" --progress
+```
 
-   # Specify folder and direct server name:
-   ./gofile.sh upload-file "/path/to/myvideo.mp4" MyFolderId store6
-   ```
+### 3) Upload multiple files into the same folder automatically
 
-4. **Create a folder**:
-   ```bash
-   ./gofile.sh create-folder rootFolderId "My New Folder"
-   ```
+```bash
+./gofile.sh upload ./a.bin ./b.bin ./c.bin --progress
+```
 
-5. **Update content (rename folder)**:
-   ```bash
-   ./gofile.sh update-content myFolderId name "Super Cool Folder"
-   ```
+### 4) Upload to a specific folder
 
-6. **Delete content**:
-   ```bash
-   ./gofile.sh delete-content fileId1,fileId2
-   ```
+```bash
+./gofile.sh upload "./video.mp4" --folder MyFolderId
+```
 
-7. **Get folder details**:
-   ```bash
-   ./gofile.sh get-content myFolderId
-   ```
+### 5) Legacy-style server selection (optional)
 
-8. **Search**:
-   ```bash
-   ./gofile.sh search-content myFolderId "music"
-   ```
+```bash
+./gofile.sh upload "./video.mp4" --zone eu
+# or:
+./gofile.sh upload "./video.mp4" --server store6
+```
 
-9. **Create a direct link**:
-   ```bash
-   ./gofile.sh create-direct-link myFileId 1704067200 "192.168.1.10" "example.com" "alice:secret"
-   ```
+### 6) List a folder by URL
 
-10. **Copy content**:
-    ```bash
-    ./gofile.sh copy-content fileId1,fileId2 destinationFolderId
-    ```
+```bash
+./gofile.sh ls https://gofile.io/d/AbCdEf
+```
 
-11. **Move content**:
-    ```bash
-    ./gofile.sh move-content folderId1,fileId99 anotherFolderId
-    ```
+### 7) Search with spaces (URL-encoded safely)
 
-12. **Import content**:
-    ```bash
-    ./gofile.sh import-content publicFileId1,publicFolderId2
-    ```
+```bash
+./gofile.sh search-content MyFolderId "music files"
+```
 
-13. **Get account ID**:
-    ```bash
-    ./gofile.sh get-account-id
-    ```
+### 8) Password hashing helper + protected content access
 
-14. **Reset token**:
-    ```bash
-    ./gofile.sh reset-token 12345
-    ```
+```bash
+./gofile.sh hash-password "secret"
+./gofile.sh get-content MyFolderId --password "secret"
+# or:
+./gofile.sh get-content MyFolderId --password-hash <sha256hex>
+```
+
+### 9) Create a direct link with restrictions
+
+```bash
+./gofile.sh create-direct-link MyFileId 1704067200 "192.168.1.10" "example.com" "alice:secret" "bad.com"
+```
 
 ---
 
 ## License
 
-This project is released under the [MIT License](LICENSE). Feel free to modify and distribute as needed. Contributions are welcome!
+MIT License. See [LICENSE](LICENSE).
