@@ -172,7 +172,7 @@ Usage:
 
   Notes:
 
-  * Uses the **global upload endpoint** by default. ([gofile.io][1])
+  * Uses the **global upload endpoint** by default.
   * If `--folder` is omitted, the CLI reuses the folder returned by the first upload when uploading multiple files.
 
 * `upload-file <filePath> [folderId] [zoneOrServer]`
