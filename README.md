@@ -1,8 +1,10 @@
 # Gofile CLI (Bash)
 
-A simple but robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), manage folders/contents, search, create direct links, and handle account actions, straight from your terminal.
+A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), manage folders and content, search, create direct links, and handle account actions from your terminal.
 
 > Uploads default to Gofile’s **global upload endpoint**, and the CLI can reuse the returned `folderId`/`guestToken` to keep multiple uploads in the same folder automatically.
+
+> The Gofile API is currently in beta. Most API operations require a token, and some require a Premium account; availability is controlled by Gofile.
 
 ---
 
@@ -16,6 +18,8 @@ A simple but robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io AP
   - [Global Options](#global-options)
   - [Commands](#commands)
 - [Examples](#examples)
+- [Network settings](#network-settings)
+- [Development](#development)
 - [License](#license)
 
 ---
@@ -34,7 +38,9 @@ A simple but robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io AP
   - Uses Gofile’s **global upload endpoint** by default.
   - Upload **multiple files** in one command; if you don’t pass `--folder`, the CLI reuses the folder returned by the first upload.
   - Optional `--progress` for a progress bar.
-  - Optional server selection by `--zone eu|na` or `--server storeX` (legacy-style).
+  - Official regional endpoints via `--region`; compatibility aliases via `--zone eu|na`.
+  - Validates every input file before the first upload starts.
+  - Refuses to send an account token to a non-Gofile custom URL.
 
 - **More ergonomic commands**
   - `ls` prints a human-friendly listing of a folder.
@@ -49,7 +55,12 @@ A simple but robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io AP
 
 - **Better output and error handling**
   - Default pretty JSON output; switch to raw/compact when needed.
-  - Fails clearly on HTTP/API errors.
+  - Fails clearly on invalid options, network failures, HTTP errors, and API errors.
+  - Configurable connect and total request timeouts.
+
+- **Quality checks**
+  - ShellCheck static analysis.
+  - Automated smoke tests and GitHub Actions CI.
 
 ---
 
@@ -137,6 +148,7 @@ Usage:
 * `-v, --verbose`: verbose output (repeat for more)
 * `--raw`: print raw JSON (no jq formatting)
 * `--compact`: print compact JSON (`jq -c`)
+* `--version`: show the CLI version
 * `-h, --help`: show help
 
 ---
@@ -168,12 +180,17 @@ Usage:
 
 ### Upload
 
-* `upload <file...> [--folder <folderIdOrUrl>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--progress] [--json]`
+* `upload <file...> [--folder <folderIdOrUrl>] [--region <region>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--allow-custom-auth] [--progress] [--json]`
 
   Notes:
 
   * Uses the **global upload endpoint** by default.
   * If `--folder` is omitted, the CLI reuses the folder returned by the first upload when uploading multiple files.
+  * Supported regions: `eu-par`, `na-phx`, `ap-sgp`, `ap-hkg`, `ap-tyo`, `sa-sao`.
+  * `--zone eu|na` remains available as an alias for `--region eu-par|na-phx`.
+  * `--server` uses the legacy storage-server endpoint.
+  * `--region`, `--zone`, `--server`, and `--url` are mutually exclusive.
+  * Custom upload URLs must use HTTPS. When a token is active, only official `*.gofile.io` URLs are accepted by default. Use global `--guest` for an unauthenticated custom upload or explicitly pass `--allow-custom-auth` if you trust the custom endpoint.
 
 * `upload-file <filePath> [folderId] [zoneOrServer]`
   Backwards-compatible wrapper for older usage (prefer `upload` going forward).
@@ -183,13 +200,13 @@ Usage:
 ### Folders & contents
 
 * `create-folder <parentFolderIdOrUrl> [folderName] [--public true|false]` (alias: `mkdir`)
-* `ls <folderIdOrUrl> [--json]`
+* `ls <folderIdOrUrl> [--password <pw> | --password-hash <sha256hex>] [--json]`
 * `get-content <folderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
 * `search-content <folderIdOrUrl> <searchString> [--password <pw> | --password-hash <sha256hex>]` (alias: `search`)
 * `update-content <contentIdOrUrl> <attribute> <newValue>`
 * `delete-content <contentIdsCsv>` (alias: `rm`)
 * `copy-content <contentsIdCsv> <destFolderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
-* `move-content <contentsIdCsv> <destFolderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
+* `move-content <contentsIdCsv> <destFolderIdOrUrl>`
 * `import-content <contentsIdCsv> [--password <pw> | --password-hash <sha256hex>]`
 
 > Tip: For most commands you can pass either a **content ID** or a **share URL** like `https://gofile.io/d/AbCdEf`, the CLI extracts the ID automatically.
@@ -201,6 +218,8 @@ Usage:
 * `create-direct-link <contentIdOrUrl> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
 * `update-direct-link <contentIdOrUrl> <directLinkId> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
 * `delete-direct-link <contentIdOrUrl> <directLinkId>`
+
+> When updating a direct link, Gofile removes restrictions omitted from the request. Pass every restriction you want to keep.
 
 ---
 
@@ -243,11 +262,13 @@ Usage:
 ./gofile.sh upload "./video.mp4" --folder MyFolderId
 ```
 
-### 5) Legacy-style server selection (optional)
+### 5) Regional upload (optional)
 
 ```bash
+./gofile.sh upload "./video.mp4" --region eu-par
+# compatibility alias:
 ./gofile.sh upload "./video.mp4" --zone eu
-# or:
+# legacy server selection:
 ./gofile.sh upload "./video.mp4" --server store6
 ```
 
@@ -277,6 +298,32 @@ Usage:
 ```bash
 ./gofile.sh create-direct-link MyFileId 1704067200 "192.168.1.10" "example.com" "alice:secret" "bad.com"
 ```
+
+---
+
+## Network settings
+
+The following optional environment variables control requests:
+
+* `GOFILE_CONNECT_TIMEOUT`: connection timeout in seconds (default: `15`)
+* `GOFILE_MAX_TIME`: maximum total request time in seconds (default: `0`, unlimited)
+* `GOFILE_API_BASE`: alternate API base URL
+* `GOFILE_UPLOAD_URL`: alternate default upload URL
+
+For large uploads, keep `GOFILE_MAX_TIME=0` or choose a suitably high value.
+
+---
+
+## Development
+
+Run the local checks with:
+
+```bash
+shellcheck --severity=style gofile.sh tests/smoke.sh
+bash tests/smoke.sh
+```
+
+The smoke tests use a local mock and do not upload or delete remote content.
 
 ---
 

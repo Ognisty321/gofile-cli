@@ -6,8 +6,8 @@
 #
 # Notes:
 # - Defaults to the official global upload endpoint:
-#     POST https://upload.gofile.io/uploadfile  (Method Not Allowed on GET, so it exists)
-# - Falls back to legacy store-server upload if you pass --server or --zone.
+#     POST https://upload.gofile.io/uploadfile
+# - Supports official regional upload proxies and a legacy --server option.
 #
 # License: MIT (same spirit as original)
 #
@@ -15,7 +15,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # --------------------------------------------------
 # Config (XDG-friendly)
@@ -26,7 +26,10 @@ CONFIG_DIR="${GOFILE_CONFIG_DIR:-$XDG_CONFIG_HOME/gofile-cli}"
 CONFIG_FILE="${GOFILE_CONFIG_FILE:-$CONFIG_DIR/config}"
 
 API_BASE="${GOFILE_API_BASE:-https://api.gofile.io}"
+API_BASE="${API_BASE%/}"
 UPLOAD_URL_DEFAULT="${GOFILE_UPLOAD_URL:-https://upload.gofile.io/uploadfile}"
+CURL_CONNECT_TIMEOUT="${GOFILE_CONNECT_TIMEOUT:-15}"
+CURL_MAX_TIME="${GOFILE_MAX_TIME:-0}"
 
 # --------------------------------------------------
 # Global flags
@@ -56,10 +59,28 @@ debug() {
 }
 
 init_config() {
-  mkdir -p "$CONFIG_DIR"
-  touch "$CONFIG_FILE"
-  # best-effort permissions hardening
+  local config_parent="."
+  if [[ "$CONFIG_FILE" == */* ]]; then
+    config_parent="${CONFIG_FILE%/*}"
+  fi
+  if [[ ! -d "$config_parent" ]]; then
+    (umask 077; mkdir -p -- "$config_parent")
+  fi
+  (umask 077; touch "$CONFIG_FILE")
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+}
+
+require_value() {
+  local option="$1"
+  local count="$2"
+  [[ "$count" -ge 2 ]] || die "$option requires a value"
+}
+
+require_exact_args() {
+  local expected="$1"
+  local usage_text="$2"
+  local actual="$3"
+  [[ "$actual" -eq "$expected" ]] || die "Usage: $0 $usage_text"
 }
 
 # Token precedence:
@@ -68,25 +89,24 @@ init_config() {
 # 3) config file API_TOKEN=
 get_token() {
   if [[ "$NO_AUTH" -eq 1 ]]; then
-    echo ""
+    printf '\n'
     return 0
   fi
 
   if [[ -n "${CLI_TOKEN:-}" ]]; then
-    echo "$CLI_TOKEN"
+    printf '%s\n' "$CLI_TOKEN"
     return 0
   fi
 
   if [[ -n "${GOFILE_TOKEN:-}" ]]; then
-    echo "$GOFILE_TOKEN"
+    printf '%s\n' "$GOFILE_TOKEN"
     return 0
   fi
 
   if [[ -f "$CONFIG_FILE" ]]; then
-    # shellcheck disable=SC2002
-    cat "$CONFIG_FILE" | awk -F'=' '/^API_TOKEN=/{sub(/^API_TOKEN=/,""); print; exit}'
+    awk '/^API_TOKEN=/{sub(/^API_TOKEN=/,""); sub(/\r$/, ""); print; exit}' "$CONFIG_FILE"
   else
-    echo ""
+    printf '\n'
   fi
 }
 
@@ -99,16 +119,22 @@ require_token() {
 set_token() {
   local new_token="$1"
   [[ -n "$new_token" ]] || die "Usage: $0 set-token <TOKEN>"
+  [[ "$new_token" != *$'\n'* && "$new_token" != *$'\r'* ]] || die "Token must be a single line"
   init_config
 
-  # write atomically; keep any other lines
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")" || die "Could not create a temporary config file"
+  trap '[[ -z "${tmp-}" ]] || rm -f -- "$tmp"' EXIT
   if [[ -s "$CONFIG_FILE" ]]; then
     grep -v '^API_TOKEN=' "$CONFIG_FILE" >"$tmp" || true
   fi
   printf 'API_TOKEN=%s\n' "$new_token" >>"$tmp"
-  mv "$tmp" "$CONFIG_FILE"
+  if ! mv -f "$tmp" "$CONFIG_FILE"; then
+    rm -f -- "$tmp"
+    die "Could not update $CONFIG_FILE"
+  fi
+  tmp=""
+  trap - EXIT
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
   say "API token saved to $CONFIG_FILE"
 }
@@ -116,9 +142,15 @@ set_token() {
 unset_token() {
   init_config
   local tmp
-  tmp="$(mktemp)"
+  tmp="$(mktemp "${CONFIG_FILE}.tmp.XXXXXX")" || die "Could not create a temporary config file"
+  trap '[[ -z "${tmp-}" ]] || rm -f -- "$tmp"' EXIT
   grep -v '^API_TOKEN=' "$CONFIG_FILE" >"$tmp" || true
-  mv "$tmp" "$CONFIG_FILE"
+  if ! mv -f "$tmp" "$CONFIG_FILE"; then
+    rm -f -- "$tmp"
+    die "Could not update $CONFIG_FILE"
+  fi
+  tmp=""
+  trap - EXIT
   chmod 600 "$CONFIG_FILE" 2>/dev/null || true
   say "API token removed from $CONFIG_FILE"
 }
@@ -126,10 +158,31 @@ unset_token() {
 mask_token() {
   local t="$1"
   if [[ ${#t} -le 8 ]]; then
-    printf '%s' "$t"
+    printf '********'
   else
     printf '%s…%s' "${t:0:4}" "${t: -4}"
   fi
+}
+
+validate_password_hash() {
+  local hash="$1"
+  [[ "$hash" =~ ^[[:xdigit:]]{64}$ ]] || die "Password hash must be exactly 64 hexadecimal characters"
+}
+
+validate_http_settings() {
+  [[ "$CURL_CONNECT_TIMEOUT" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "GOFILE_CONNECT_TIMEOUT must be a non-negative number"
+  [[ "$CURL_MAX_TIME" =~ ^[0-9]+([.][0-9]+)?$ ]] || die "GOFILE_MAX_TIME must be a non-negative number"
+}
+
+is_official_gofile_url() {
+  [[ "$1" =~ ^https://([[:alnum:]-]+\.)*gofile\.io(/|$) ]]
+}
+
+curl_form_escape_path() {
+  local path="$1"
+  path="${path//\\/\\\\}"
+  path="${path//\"/\\\"}"
+  printf '%s' "$path"
 }
 
 print_json() {
@@ -192,7 +245,14 @@ curl_json() {
   local token
   token="$(get_token)"
 
-  local args=(-sS -X "$method" -H "Accept: application/json")
+  local args=(
+    -sS
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -X "$method"
+    -H "Accept: application/json"
+    -H "User-Agent: gofile-cli/$VERSION"
+  )
   if [[ -n "$token" ]]; then
     args+=(-H "Authorization: Bearer $token")
   fi
@@ -204,25 +264,33 @@ curl_json() {
   debug "curl_json $method $url"
 
   local resp http_code body
-  resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"
+  if ! resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"; then
+    err "Request failed: $method $url"
+    return 1
+  fi
   http_code="${resp##*$'\n'}"
   body="${resp%$'\n'*}"
 
-  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+  if [[ ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+    err "Invalid HTTP status from $url"
+    return 1
+  fi
+
+  if (( 10#$http_code < 200 || 10#$http_code >= 300 )); then
     err "HTTP $http_code from $url"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
   # Validate JSON + API status
-  if ! echo "$body" | jq -e '.' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$body" | jq -e '.' >/dev/null 2>&1; then
     err "Non-JSON response from $url"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
   local status
-  status="$(echo "$body" | jq -r '.status // empty')"
+  status="$(printf '%s\n' "$body" | jq -r '.status // empty')"
   if [[ -n "$status" && "$status" != "ok" ]]; then
     err "API status=$status"
     printf '%s\n' "$body" >&2
@@ -240,12 +308,20 @@ curl_json_get_urlencoded() {
   local token
   token="$(get_token)"
 
-  local args=(-sS -G -H "Accept: application/json")
+  local args=(
+    -sS
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -G
+    -H "Accept: application/json"
+    -H "User-Agent: gofile-cli/$VERSION"
+  )
   if [[ -n "$token" ]]; then
     args+=(-H "Authorization: Bearer $token")
   fi
 
   while [[ $# -gt 0 ]]; do
+    [[ $# -ge 2 ]] || die "Internal error: query parameter has no value"
     local k="$1"; local v="$2"
     args+=(--data-urlencode "$k=$v")
     shift 2
@@ -254,24 +330,32 @@ curl_json_get_urlencoded() {
   debug "curl_json_get_urlencoded $url"
 
   local resp http_code body
-  resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"
+  if ! resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"; then
+    err "Request failed: GET $url"
+    return 1
+  fi
   http_code="${resp##*$'\n'}"
   body="${resp%$'\n'*}"
 
-  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+  if [[ ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+    err "Invalid HTTP status from $url"
+    return 1
+  fi
+
+  if (( 10#$http_code < 200 || 10#$http_code >= 300 )); then
     err "HTTP $http_code from $url"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
-  if ! echo "$body" | jq -e '.' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$body" | jq -e '.' >/dev/null 2>&1; then
     err "Non-JSON response from $url"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
   local status
-  status="$(echo "$body" | jq -r '.status // empty')"
+  status="$(printf '%s\n' "$body" | jq -r '.status // empty')"
   if [[ -n "$status" && "$status" != "ok" ]]; then
     err "API status=$status"
     printf '%s\n' "$body" >&2
@@ -287,11 +371,17 @@ curl_upload() {
   local file="$2"
   local folder_id="${3-}"
   local progress="${4-0}"
-  local token="$5"   # explicit token (may be empty)
+  local token="${5-}"   # explicit token (may be empty)
 
   [[ -f "$file" ]] || die "File not found: $file"
 
-  local args=(-X POST -H "Accept: application/json")
+  local args=(
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -X POST
+    -H "Accept: application/json"
+    -H "User-Agent: gofile-cli/$VERSION"
+  )
   if [[ -n "$token" ]]; then
     args+=(-H "Authorization: Bearer $token")
   fi
@@ -302,7 +392,9 @@ curl_upload() {
     args+=(-sS)
   fi
 
-  args+=(-F "file=@$file")
+  local escaped_file
+  escaped_file="$(curl_form_escape_path "$file")"
+  args+=(-F "file=@\"${escaped_file}\"")
   if [[ -n "$folder_id" ]]; then
     args+=(-F "folderId=$folder_id")
   fi
@@ -310,24 +402,32 @@ curl_upload() {
   debug "curl_upload $url file=$file folder=$folder_id auth=$([[ -n "$token" ]] && echo yes || echo no)"
 
   local resp http_code body
-  resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"
+  if ! resp="$(curl "${args[@]}" "$url" -w $'\n%{http_code}')"; then
+    err "Upload failed: $file"
+    return 1
+  fi
   http_code="${resp##*$'\n'}"
   body="${resp%$'\n'*}"
 
-  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+  if [[ ! "$http_code" =~ ^[0-9]{3}$ ]]; then
+    err "Invalid HTTP status from $url"
+    return 1
+  fi
+
+  if (( 10#$http_code < 200 || 10#$http_code >= 300 )); then
     err "HTTP $http_code from $url"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
-  if ! echo "$body" | jq -e '.' >/dev/null 2>&1; then
+  if ! printf '%s\n' "$body" | jq -e '.' >/dev/null 2>&1; then
     err "Non-JSON response from upload endpoint"
     printf '%s\n' "$body" >&2
     return 1
   fi
 
   local status
-  status="$(echo "$body" | jq -r '.status // empty')"
+  status="$(printf '%s\n' "$body" | jq -r '.status // empty')"
   if [[ -n "$status" && "$status" != "ok" ]]; then
     err "API status=$status"
     printf '%s\n' "$body" >&2
@@ -354,6 +454,7 @@ Global options:
   -v, --verbose       Verbose output (repeat for more)
   --raw               Print raw JSON (no jq formatting)
   --compact           Print compact JSON (jq -c)
+  --version           Show version
   -h, --help          Show help
 
 Token management:
@@ -366,15 +467,19 @@ Server info:
   get-servers [zone]         Show available servers (zone optional: eu|na)
 
 Upload:
-  upload <file...> [--folder <folderId>] [--zone eu|na] [--server <storeX>] [--url <uploadUrl>] [--progress] [--json]
+  upload <file...> [--folder <folderIdOrUrl>] [--region <region>] [--zone eu|na] [--server <storeX>] [--url <uploadUrl>] [--allow-custom-auth] [--progress] [--json]
       - Default is official global upload endpoint: ${UPLOAD_URL_DEFAULT}
-      - If you pass --zone or --server, it will upload to https://<server>.gofile.io/contents/uploadfile
+      - Regions: eu-par, na-phx, ap-sgp, ap-hkg, ap-tyo, sa-sao
+      - --zone eu|na is a compatibility alias for eu-par|na-phx.
+      - --server uses the legacy https://<server>.gofile.io/contents/uploadfile endpoint.
+      - --allow-custom-auth explicitly permits sending your token to a non-Gofile --url.
       - If uploading multiple files without --folder, it will reuse the folder created/used by the first upload.
 
 Content:
   get-content <folderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]
   search-content <folderIdOrUrl> <query> [--password <plain>] [--password-hash <sha256hex>]
-  ls <folderIdOrUrl>                         List children in a folder (human-friendly)
+  ls <folderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>] [--json]
+                                               List children in a folder
   create-folder <parentFolderIdOrUrl> [name] [--public true|false]
 
   update-content <contentIdOrUrl> <attribute> <value>
@@ -389,7 +494,7 @@ Direct links:
 
 Moves / copies:
   copy-content <contentsIdCsv> <destFolderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]
-  move-content <contentsIdCsv> <destFolderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]
+  move-content <contentsIdCsv> <destFolderIdOrUrl>
   import-content <contentsIdCsv> [--password <plain>] [--password-hash <sha256hex>]
 
 Account:
@@ -415,121 +520,168 @@ EOF
 # --------------------------------------------------
 
 cmd_show_token() {
+  if [[ "$NO_AUTH" -eq 1 ]]; then
+    say "Authentication is disabled for this invocation (--guest)."
+    return 0
+  fi
+
   local t
   t="$(get_token)"
   if [[ -z "$t" ]]; then
     say "No API token set."
   else
     say "Token: $(mask_token "$t")"
-    say "Config: $CONFIG_FILE"
+    if [[ -n "$CLI_TOKEN" ]]; then
+      say "Source: --token"
+    elif [[ -n "${GOFILE_TOKEN:-}" ]]; then
+      say "Source: GOFILE_TOKEN"
+    else
+      say "Source: $CONFIG_FILE"
+    fi
   fi
 }
 
 cmd_get_servers() {
   # /servers is public (token not required), but we still include Authorization if available.
+  [[ $# -le 1 ]] || die "Usage: $0 get-servers [zone]"
   local zone="${1-}"
-  local url="${API_BASE}/servers"
   if [[ -n "$zone" ]]; then
-    url="${url}?zone=${zone}"
+    [[ "$zone" == "eu" || "$zone" == "na" ]] || die "zone must be eu or na"
+    curl_json_get_urlencoded "${API_BASE}/servers" zone "$zone" | print_json
+  else
+    curl_json "GET" "${API_BASE}/servers" | print_json
   fi
-
-  curl_json "GET" "$url" | print_json
-}
-
-pick_server_by_zone() {
-  # outputs server name or empty
-  local zone="$1"
-  local resp
-  resp="$(curl_json "GET" "${API_BASE}/servers?zone=${zone}")"
-  echo "$resp" | jq -r '.data.servers[0].name // empty'
 }
 
 cmd_upload() {
-  # upload <file...> [--folder <folderId>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--progress] [--json]
+  # upload <file...> [--folder <folderId>] [--region <region>] [--zone eu|na]
+  #        [--server storeX] [--url <uploadUrl>] [--progress] [--json]
   local folder_id=""
+  local folder_was_set=0
+  local region=""
   local zone=""
   local server=""
   local upload_url="$UPLOAD_URL_DEFAULT"
+  local endpoint_options=0
+  local allow_custom_auth=0
   local progress=0
   local as_json=0
 
-  # parse options (allow them anywhere before files)
-  local args=()
+  local -a args=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --folder|-f) folder_id="${2-}"; shift 2 ;;
-      --zone) zone="${2-}"; shift 2 ;;
-      --server) server="${2-}"; shift 2 ;;
-      --url) upload_url="${2-}"; shift 2 ;;
+      --folder|-f)
+        require_value "$1" "$#"
+        folder_id="$2"
+        folder_was_set=1
+        shift 2
+        ;;
+      --region)
+        require_value "$1" "$#"
+        region="$2"
+        endpoint_options=$((endpoint_options + 1))
+        shift 2
+        ;;
+      --zone)
+        require_value "$1" "$#"
+        zone="$2"
+        endpoint_options=$((endpoint_options + 1))
+        shift 2
+        ;;
+      --server)
+        require_value "$1" "$#"
+        server="$2"
+        endpoint_options=$((endpoint_options + 1))
+        shift 2
+        ;;
+      --url)
+        require_value "$1" "$#"
+        upload_url="$2"
+        endpoint_options=$((endpoint_options + 1))
+        shift 2
+        ;;
+      --allow-custom-auth) allow_custom_auth=1; shift ;;
       --progress) progress=1; shift ;;
       --json) as_json=1; shift ;;
       --) shift; break ;;
       -h|--help) usage; exit 0 ;;
+      -*) die "Unknown upload option: $1" ;;
       *) args+=("$1"); shift ;;
     esac
   done
-  # any remaining positional args after --
   while [[ $# -gt 0 ]]; do args+=("$1"); shift; done
 
-  [[ ${#args[@]} -gt 0 ]] || die "Usage: $0 upload <file...> [--folder <folderId>] [--zone eu|na] [--server <storeX>] [--url <uploadUrl>]"
+  [[ ${#args[@]} -gt 0 ]] || die "Usage: $0 upload <file...> [--folder <folderIdOrUrl>] [--region <region>] [--zone eu|na]"
+  (( endpoint_options <= 1 )) || die "Use only one of --region, --zone, --server, or --url"
 
-  # Determine upload endpoint:
-  # If --server explicitly set -> legacy store endpoint.
-  # Else if --zone set -> pick a server and use legacy store endpoint.
-  if [[ -n "$server" ]]; then
-    upload_url="https://${server}.gofile.io/contents/uploadfile"
-  elif [[ -n "$zone" ]]; then
-    local picked
-    picked="$(pick_server_by_zone "$zone")"
-    [[ -n "$picked" ]] || die "No server found for zone=$zone"
-    upload_url="https://${picked}.gofile.io/contents/uploadfile"
-    server="$picked"
+  if [[ "$folder_was_set" -eq 1 ]]; then
+    [[ -n "$folder_id" ]] || die "--folder requires a non-empty folder ID"
+    folder_id="$(extract_id "$folder_id")"
   fi
 
+  if [[ -n "$region" ]]; then
+    case "$region" in
+      eu-par|na-phx|ap-sgp|ap-hkg|ap-tyo|sa-sao) ;;
+      *) die "Unknown region: $region (expected eu-par, na-phx, ap-sgp, ap-hkg, ap-tyo, or sa-sao)" ;;
+    esac
+    upload_url="https://upload-${region}.gofile.io/uploadfile"
+  elif [[ -n "$zone" ]]; then
+    case "$zone" in
+      eu) upload_url="https://upload-eu-par.gofile.io/uploadfile" ;;
+      na) upload_url="https://upload-na-phx.gofile.io/uploadfile" ;;
+      *) die "zone must be eu or na" ;;
+    esac
+  elif [[ -n "$server" ]]; then
+    [[ "$server" =~ ^[[:alnum:]-]+$ ]] || die "Invalid server name: $server"
+    upload_url="https://${server}.gofile.io/contents/uploadfile"
+  fi
+
+  [[ "$upload_url" =~ ^https:// ]] || die "Upload URL must use HTTPS"
+
+  local f
+  for f in "${args[@]}"; do
+    [[ -f "$f" ]] || die "File not found: $f"
+    [[ -r "$f" ]] || die "File is not readable: $f"
+  done
+
   local token
-  token="$(get_token)"  # may be empty in guest mode
+  token="$(get_token)"
+  if [[ -n "$token" && "$allow_custom_auth" -eq 0 ]] && ! is_official_gofile_url "$upload_url"; then
+    die "Refusing to send your token to a non-Gofile URL. Use --guest or explicitly pass --allow-custom-auth."
+  fi
+
   local session_token="$token"
-
   local used_folder="$folder_id"
-
-  # Collect JSON responses if requested
-  local tmp_json
-  tmp_json="$(mktemp)"
-  : >"$tmp_json"
+  local -a responses=()
 
   for f in "${args[@]}"; do
-    # If user provided a folderId, always reuse it.
-    # Else if multiple uploads: after first upload, reuse returned parentFolder.
     local resp
     resp="$(curl_upload "$upload_url" "$f" "$used_folder" "$progress" "$session_token")"
 
     if [[ "$as_json" -eq 1 ]]; then
-      printf '%s\n' "$resp" >>"$tmp_json"
+      responses+=("$resp")
     else
-      local file_name download_page file_id parent_folder
-      file_name="$(echo "$resp" | jq -r '.data.fileName // .data.name // empty')"
-      download_page="$(echo "$resp" | jq -r '.data.downloadPage // empty')"
-      file_id="$(echo "$resp" | jq -r '.data.fileId // empty')"
-      parent_folder="$(echo "$resp" | jq -r '.data.parentFolder // .data.folderId // empty')"
+      local file_name download_page file_id
+      file_name="$(printf '%s\n' "$resp" | jq -r '.data.fileName // .data.name // empty')"
+      download_page="$(printf '%s\n' "$resp" | jq -r '.data.downloadPage // empty')"
+      file_id="$(printf '%s\n' "$resp" | jq -r '.data.fileId // empty')"
       [[ -n "$file_name" ]] || file_name="$(basename "$f")"
       say "✅ Uploaded: $file_name"
       [[ -n "$download_page" ]] && say "   🔗 $download_page"
       [[ -n "$file_id" ]] && say "   id: $file_id"
     fi
 
-    # Smart reuse: if no folder was specified, reuse the folder returned by first upload
     if [[ -z "$folder_id" ]]; then
       local pf
-      pf="$(echo "$resp" | jq -r '.data.parentFolder // .data.folderId // empty')"
+      pf="$(printf '%s\n' "$resp" | jq -r '.data.parentFolder // .data.folderId // empty')"
       if [[ -n "$pf" ]]; then
         used_folder="$pf"
       fi
     fi
 
-    # Smart guest reuse: if we had no token, try to reuse guest token if API returns it
     if [[ -z "$token" ]]; then
       local gt
-      gt="$(echo "$resp" | jq -r '.data.guestToken // .data.token // empty')"
+      gt="$(printf '%s\n' "$resp" | jq -r '.data.guestToken // .data.token // empty')"
       if [[ -n "$gt" ]]; then
         session_token="$gt"
       fi
@@ -537,15 +689,14 @@ cmd_upload() {
   done
 
   if [[ "$as_json" -eq 1 ]]; then
-    # Build JSON array from line-delimited JSON objects
-    jq -s '.' "$tmp_json" | print_json
+    printf '%s\n' "${responses[@]}" | jq -s '.' | print_json
   fi
-  rm -f "$tmp_json"
 }
 
 cmd_upload_file_compat() {
   # Backwards compatible with your original:
   # upload-file <filePath> [folderId] [zoneOrServer]
+  [[ $# -le 3 ]] || die "Usage: $0 upload-file <filePath> [folderId] [zoneOrServer]"
   local filePath="${1-}"
   local folderId="${2-}"
   local zoneOrServer="${3-}"
@@ -558,34 +709,58 @@ cmd_upload_file_compat() {
     folderId=""
   fi
 
+  local -a upload_args=("$filePath")
+  if [[ -n "$folderId" ]]; then
+    upload_args+=(--folder "$folderId")
+  fi
+
   if [[ -n "$zoneOrServer" && ( "$zoneOrServer" == "eu" || "$zoneOrServer" == "na" ) ]]; then
-    cmd_upload "$filePath" --folder "$folderId" --zone "$zoneOrServer" --json
+    cmd_upload "${upload_args[@]}" --zone "$zoneOrServer" --json
   elif [[ -n "$zoneOrServer" ]]; then
-    cmd_upload "$filePath" --folder "$folderId" --server "$zoneOrServer" --json
+    cmd_upload "${upload_args[@]}" --server "$zoneOrServer" --json
   else
-    cmd_upload "$filePath" --folder "$folderId" --json
+    cmd_upload "${upload_args[@]}" --json
   fi
 }
 
 cmd_create_folder() {
   # create-folder <parentFolderId> [folderName] [--public true|false]
-  require_token
-
   local parent="${1-}"
-  local name="${2-}"
-  shift || true
-  shift || true
-
-  parent="$(extract_id "${parent:-}")"
   [[ -n "$parent" ]] || die "Usage: $0 create-folder <parentFolderId> [folderName] [--public true|false]"
+  shift
+  parent="$(extract_id "$parent")"
 
+  local name=""
   local public_val=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --public) public_val="${2-}"; shift 2 ;;
-      *) shift ;;
+      --public)
+        require_value "$1" "$#"
+        public_val="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        while [[ $# -gt 0 ]]; do
+          [[ -z "$name" ]] || die "Only one folder name may be specified"
+          name="$1"
+          shift
+        done
+        ;;
+      -*) die "Unknown create-folder option: $1" ;;
+      *)
+        [[ -z "$name" ]] || die "Only one folder name may be specified"
+        name="$1"
+        shift
+        ;;
     esac
   done
+
+  if [[ -n "$public_val" && "$public_val" != "true" && "$public_val" != "false" ]]; then
+    die "--public must be true or false"
+  fi
+
+  require_token
 
   local payload
   if [[ -n "$name" ]]; then
@@ -595,10 +770,7 @@ cmd_create_folder() {
   fi
 
   if [[ -n "$public_val" ]]; then
-    case "$public_val" in
-      true|false) payload="$(echo "$payload" | jq --argjson p "$public_val" '. + {public: $p}')" ;;
-      *) die "--public must be true or false" ;;
-    esac
+    payload="$(printf '%s\n' "$payload" | jq --argjson p "$public_val" '. + {public: $p}')"
   fi
 
   curl_json "POST" "${API_BASE}/contents/createFolder" "$payload" | print_json
@@ -606,15 +778,18 @@ cmd_create_folder() {
 
 cmd_update_content() {
   # update-content <contentId> <attribute> <value>
-  require_token
+  require_exact_args 3 "update-content <contentId> <attribute> <value>" "$#"
 
-  local cid="${1-}"
-  local attr="${2-}"
-  local val="${3-}"
+  local cid="$1"
+  local attr="$2"
+  local val="$3"
 
-  cid="$(extract_id "${cid:-}")"
-
-  [[ -n "$cid" && -n "$attr" && -n "$val" ]] || die "Usage: $0 update-content <contentId> <attribute> <value>"
+  cid="$(extract_id "$cid")"
+  [[ -n "$cid" ]] || die "Content ID must not be empty"
+  case "$attr" in
+    name|description|tags|public|expiry|password) ;;
+    *) die "Unsupported attribute: $attr (expected name, description, tags, public, expiry, or password)" ;;
+  esac
 
   local payload
 
@@ -640,13 +815,15 @@ cmd_update_content() {
       ;;
   esac
 
+  require_token
   curl_json "PUT" "${API_BASE}/contents/${cid}/update" "$payload" | print_json
 }
 
 cmd_delete_content() {
+  require_exact_args 1 "delete-content <contentIdsCsv>" "$#"
+  local ids="$1"
+  [[ -n "$ids" ]] || die "Content IDs must not be empty"
   require_token
-  local ids="${1-}"
-  [[ -n "$ids" ]] || die "Usage: $0 delete-content <contentIdsCsv>"
   local payload
   payload="$(jq -n --arg cid "$ids" '{ contentsId: $cid }')"
   curl_json "DELETE" "${API_BASE}/contents" "$payload" | print_json
@@ -654,27 +831,37 @@ cmd_delete_content() {
 
 cmd_get_content() {
   # get-content <contentId> [--password <plain>] [--password-hash <hash>]
-  require_token
   local cid="${1-}"
   [[ -n "$cid" ]] || die "Usage: $0 get-content <contentIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]"
   cid="$(extract_id "$cid")"
-  shift || true
+  shift
 
   local pw_plain=""
   local pw_hash=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --password) pw_plain="${2-}"; shift 2 ;;
-      --password-hash) pw_hash="${2-}"; shift 2 ;;
-      *) shift ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      *) die "Unknown get-content option: $1" ;;
     esac
   done
 
+  [[ -z "$pw_plain" || -z "$pw_hash" ]] || die "Use either --password or --password-hash, not both"
   if [[ -n "$pw_plain" && -z "$pw_hash" ]]; then
     pw_hash="$(sha256_hex "$pw_plain")"
   fi
+  [[ -z "$pw_hash" ]] || validate_password_hash "$pw_hash"
 
+  require_token
   if [[ -n "$pw_hash" ]]; then
     curl_json_get_urlencoded "${API_BASE}/contents/${cid}" password "$pw_hash" | print_json
   else
@@ -684,28 +871,38 @@ cmd_get_content() {
 
 cmd_search_content() {
   # search-content <folderId> <query> [--password <plain>] [--password-hash <hash>]
-  require_token
   local folder="${1-}"
   local q="${2-}"
   [[ -n "$folder" && -n "$q" ]] || die "Usage: $0 search-content <folderIdOrUrl> <query> [--password <plain>] [--password-hash <sha256hex>]"
   folder="$(extract_id "$folder")"
-  shift 2 || true
+  shift 2
 
   local pw_plain=""
   local pw_hash=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --password) pw_plain="${2-}"; shift 2 ;;
-      --password-hash) pw_hash="${2-}"; shift 2 ;;
-      *) shift ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      *) die "Unknown search-content option: $1" ;;
     esac
   done
 
+  [[ -z "$pw_plain" || -z "$pw_hash" ]] || die "Use either --password or --password-hash, not both"
   if [[ -n "$pw_plain" && -z "$pw_hash" ]]; then
     pw_hash="$(sha256_hex "$pw_plain")"
   fi
+  [[ -z "$pw_hash" ]] || validate_password_hash "$pw_hash"
 
+  require_token
   if [[ -n "$pw_hash" ]]; then
     curl_json_get_urlencoded "${API_BASE}/contents/search" contentId "$folder" searchedString "$q" password "$pw_hash" | print_json
   else
@@ -714,20 +911,45 @@ cmd_search_content() {
 }
 
 cmd_ls() {
-  # ls <folderIdOrUrl> [--json]
-  require_token
+  # ls <folderIdOrUrl> [--password <plain>] [--password-hash <hash>] [--json]
   local folder="${1-}"
-  [[ -n "$folder" ]] || die "Usage: $0 ls <folderIdOrUrl> [--json]"
+  [[ -n "$folder" ]] || die "Usage: $0 ls <folderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>] [--json]"
   folder="$(extract_id "$folder")"
-  shift || true
+  shift
 
   local as_json=0
-  if [[ "${1-}" == "--json" ]]; then
-    as_json=1
+  local pw_plain=""
+  local pw_hash=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) as_json=1; shift ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      *) die "Unknown ls option: $1" ;;
+    esac
+  done
+
+  [[ -z "$pw_plain" || -z "$pw_hash" ]] || die "Use either --password or --password-hash, not both"
+  if [[ -n "$pw_plain" ]]; then
+    pw_hash="$(sha256_hex "$pw_plain")"
   fi
+  [[ -z "$pw_hash" ]] || validate_password_hash "$pw_hash"
 
   local resp
-  resp="$(curl_json "GET" "${API_BASE}/contents/${folder}")"
+  require_token
+  if [[ -n "$pw_hash" ]]; then
+    resp="$(curl_json_get_urlencoded "${API_BASE}/contents/${folder}" password "$pw_hash")"
+  else
+    resp="$(curl_json "GET" "${API_BASE}/contents/${folder}")"
+  fi
 
   if [[ "$as_json" -eq 1 ]]; then
     printf '%s\n' "$resp" | print_json
@@ -755,13 +977,14 @@ cmd_ls() {
 csv_to_json_array() {
   # prints JSON array from comma-separated string
   local csv="$1"
+  local -a arr=()
   IFS=',' read -r -a arr <<< "$csv"
   printf '%s\n' "${arr[@]}" | jq -R . | jq -s '.'
 }
 
 cmd_create_direct_link() {
   # create-direct-link <contentId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]
-  require_token
+  [[ $# -le 6 ]] || die "Usage: $0 create-direct-link <contentId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]"
   local cid="${1-}"; cid="$(extract_id "${cid:-}")"
   [[ -n "$cid" ]] || die "Usage: $0 create-direct-link <contentId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]"
   local expireTime="${2-}"
@@ -793,12 +1016,13 @@ cmd_create_direct_link() {
     payload="$(echo "$payload" | jq --argjson a "$(csv_to_json_array "$auth")" '. + {auth: $a}')"
   fi
 
+  require_token
   curl_json "POST" "${API_BASE}/contents/${cid}/directlinks" "$payload" | print_json
 }
 
 cmd_update_direct_link() {
   # update-direct-link <contentId> <directLinkId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]
-  require_token
+  [[ $# -le 7 ]] || die "Usage: $0 update-direct-link <contentId> <directLinkId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]"
   local cid="${1-}"; cid="$(extract_id "${cid:-}")"
   local dlid="${2-}"
   [[ -n "$cid" && -n "$dlid" ]] || die "Usage: $0 update-direct-link <contentId> <directLinkId> [expireTime] [ipsCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]"
@@ -831,132 +1055,141 @@ cmd_update_direct_link() {
     payload="$(echo "$payload" | jq --argjson a "$(csv_to_json_array "$auth")" '. + {auth: $a}')"
   fi
 
+  require_token
   curl_json "PUT" "${API_BASE}/contents/${cid}/directlinks/${dlid}" "$payload" | print_json
 }
 
 cmd_delete_direct_link() {
-  require_token
+  require_exact_args 2 "delete-direct-link <contentId> <directLinkId>" "$#"
   local cid="${1-}"; cid="$(extract_id "${cid:-}")"
   local dlid="${2-}"
   [[ -n "$cid" && -n "$dlid" ]] || die "Usage: $0 delete-direct-link <contentId> <directLinkId>"
+  require_token
   curl_json "DELETE" "${API_BASE}/contents/${cid}/directlinks/${dlid}" | print_json
 }
 
 cmd_copy_content() {
   # copy-content <contentsIdCsv> <destFolderId> [--password ...] [--password-hash ...]
-  require_token
   local contents="${1-}"
   local dest="${2-}"
   [[ -n "$contents" && -n "$dest" ]] || die "Usage: $0 copy-content <contentsIdCsv> <destFolderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]"
   dest="$(extract_id "$dest")"
-  shift 2 || true
+  shift 2
 
   local pw_plain=""
   local pw_hash=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --password) pw_plain="${2-}"; shift 2 ;;
-      --password-hash) pw_hash="${2-}"; shift 2 ;;
-      *) shift ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      *) die "Unknown copy-content option: $1" ;;
     esac
   done
-  if [[ -n "$pw_plain" && -z "$pw_hash" ]]; then
+  [[ -z "$pw_plain" || -z "$pw_hash" ]] || die "Use either --password or --password-hash, not both"
+  if [[ -n "$pw_plain" ]]; then
     pw_hash="$(sha256_hex "$pw_plain")"
   fi
+  [[ -z "$pw_hash" ]] || validate_password_hash "$pw_hash"
 
   local payload
   payload="$(jq -n --arg cid "$contents" --arg fid "$dest" '{ contentsId: $cid, folderId: $fid }')"
   if [[ -n "$pw_hash" ]]; then
-    payload="$(echo "$payload" | jq --arg p "$pw_hash" '. + {password: $p}')"
+    payload="$(printf '%s\n' "$payload" | jq --arg p "$pw_hash" '. + {password: $p}')"
   fi
 
+  require_token
   curl_json "POST" "${API_BASE}/contents/copy" "$payload" | print_json
 }
 
 cmd_move_content() {
-  # move-content <contentsIdCsv> <destFolderId> [--password ...] [--password-hash ...]
-  require_token
-  local contents="${1-}"
-  local dest="${2-}"
-  [[ -n "$contents" && -n "$dest" ]] || die "Usage: $0 move-content <contentsIdCsv> <destFolderIdOrUrl> [--password <plain>] [--password-hash <sha256hex>]"
+  # move-content <contentsIdCsv> <destFolderId>
+  require_exact_args 2 "move-content <contentsIdCsv> <destFolderIdOrUrl>" "$#"
+  local contents="$1"
+  local dest="$2"
+  [[ -n "$contents" && -n "$dest" ]] || die "Content and destination IDs must not be empty"
   dest="$(extract_id "$dest")"
-  shift 2 || true
-
-  local pw_plain=""
-  local pw_hash=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --password) pw_plain="${2-}"; shift 2 ;;
-      --password-hash) pw_hash="${2-}"; shift 2 ;;
-      *) shift ;;
-    esac
-  done
-  if [[ -n "$pw_plain" && -z "$pw_hash" ]]; then
-    pw_hash="$(sha256_hex "$pw_plain")"
-  fi
 
   local payload
   payload="$(jq -n --arg cid "$contents" --arg fid "$dest" '{ contentsId: $cid, folderId: $fid }')"
-  if [[ -n "$pw_hash" ]]; then
-    payload="$(echo "$payload" | jq --arg p "$pw_hash" '. + {password: $p}')"
-  fi
 
+  require_token
   curl_json "PUT" "${API_BASE}/contents/move" "$payload" | print_json
 }
 
 cmd_import_content() {
   # import-content <contentsIdCsv> [--password ...] [--password-hash ...]
-  require_token
   local contents="${1-}"
   [[ -n "$contents" ]] || die "Usage: $0 import-content <contentsIdCsv> [--password <plain>] [--password-hash <sha256hex>]"
-  shift || true
+  shift
 
   local pw_plain=""
   local pw_hash=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --password) pw_plain="${2-}"; shift 2 ;;
-      --password-hash) pw_hash="${2-}"; shift 2 ;;
-      *) shift ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      *) die "Unknown import-content option: $1" ;;
     esac
   done
-  if [[ -n "$pw_plain" && -z "$pw_hash" ]]; then
+  [[ -z "$pw_plain" || -z "$pw_hash" ]] || die "Use either --password or --password-hash, not both"
+  if [[ -n "$pw_plain" ]]; then
     pw_hash="$(sha256_hex "$pw_plain")"
   fi
+  [[ -z "$pw_hash" ]] || validate_password_hash "$pw_hash"
 
   local payload
   payload="$(jq -n --arg cid "$contents" '{ contentsId: $cid }')"
   if [[ -n "$pw_hash" ]]; then
-    payload="$(echo "$payload" | jq --arg p "$pw_hash" '. + {password: $p}')"
+    payload="$(printf '%s\n' "$payload" | jq --arg p "$pw_hash" '. + {password: $p}')"
   fi
 
+  require_token
   curl_json "POST" "${API_BASE}/contents/import" "$payload" | print_json
 }
 
 cmd_get_account_id() {
+  require_exact_args 0 "get-account-id" "$#"
   require_token
   curl_json "GET" "${API_BASE}/accounts/getid" | print_json
 }
 
 cmd_get_account() {
+  require_exact_args 1 "get-account <accountId>" "$#"
+  local id="$1"
+  [[ -n "$id" ]] || die "Account ID must not be empty"
   require_token
-  local id="${1-}"
-  [[ -n "$id" ]] || die "Usage: $0 get-account <accountId>"
   curl_json "GET" "${API_BASE}/accounts/${id}" | print_json
 }
 
 cmd_whoami() {
+  require_exact_args 0 "whoami" "$#"
   require_token
   local resp_id
   resp_id="$(curl_json "GET" "${API_BASE}/accounts/getid")"
   local account_id
-  account_id="$(echo "$resp_id" | jq -r '.data.id // empty')"
+  account_id="$(printf '%s\n' "$resp_id" | jq -r '.data.id // empty')"
   [[ -n "$account_id" ]] || die "Could not determine account id"
   local resp_acct
   resp_acct="$(curl_json "GET" "${API_BASE}/accounts/${account_id}")"
 
   local root
-  root="$(echo "$resp_acct" | jq -r '.data.rootFolder // empty')"
+  root="$(printf '%s\n' "$resp_acct" | jq -r '.data.rootFolder // empty')"
 
   say "Account: $account_id"
   if [[ -n "$root" ]]; then
@@ -967,14 +1200,16 @@ cmd_whoami() {
 }
 
 cmd_reset_token() {
+  require_exact_args 1 "reset-token <accountId>" "$#"
+  local id="$1"
+  [[ -n "$id" ]] || die "Account ID must not be empty"
   require_token
-  local id="${1-}"
-  [[ -n "$id" ]] || die "Usage: $0 reset-token <accountId>"
   curl_json "POST" "${API_BASE}/accounts/${id}/resettoken" | print_json
 }
 
 cmd_hash_password() {
-  local pw="${1-}"
+  require_exact_args 1 "hash-password <PASSWORD>" "$#"
+  local pw="$1"
   [[ -n "$pw" ]] || die "Usage: $0 hash-password <PASSWORD>"
   sha256_hex "$pw"
 }
@@ -984,20 +1219,23 @@ cmd_hash_password() {
 # --------------------------------------------------
 
 main() {
-  need_cmd curl
-  need_cmd jq
-  init_config
-
   # Global option parsing
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --token) CLI_TOKEN="${2-}"; shift 2 ;;
+      --token)
+        require_value "$1" "$#"
+        CLI_TOKEN="$2"
+        [[ -n "$CLI_TOKEN" ]] || die "--token requires a non-empty token"
+        shift 2
+        ;;
       --guest) NO_AUTH=1; shift ;;
       --raw) OUTPUT_MODE="raw"; shift ;;
       --compact) OUTPUT_MODE="compact"; shift ;;
       -v|--verbose) VERBOSE=$((VERBOSE+1)); shift ;;
       -h|--help) usage; exit 0 ;;
+      --version) say "gofile.sh v$VERSION"; exit 0 ;;
       --) shift; break ;;
+      -*) die "Unknown global option: $1" ;;
       *) break ;;
     esac
   done
@@ -1005,10 +1243,29 @@ main() {
   local cmd="${1-}"
   shift || true
 
+  [[ "$NO_AUTH" -eq 0 || -z "$CLI_TOKEN" ]] || die "--guest and --token cannot be used together"
+
   case "$cmd" in
-    set-token) set_token "${1-}" ;;
-    show-token) cmd_show_token ;;
-    unset-token) unset_token ;;
+    get-servers|servers|upload|upload-file|create-folder|mkdir|update-content|delete-content|rm|get-content|search-content|search|ls|create-direct-link|update-direct-link|delete-direct-link|copy-content|move-content|import-content|get-account-id|get-account|whoami|reset-token)
+      need_cmd curl
+      need_cmd jq
+      validate_http_settings
+      ;;
+  esac
+
+  case "$cmd" in
+    set-token)
+      require_exact_args 1 "set-token <TOKEN>" "$#"
+      set_token "$1"
+      ;;
+    show-token)
+      require_exact_args 0 "show-token" "$#"
+      cmd_show_token
+      ;;
+    unset-token)
+      require_exact_args 0 "unset-token" "$#"
+      unset_token
+      ;;
 
     hash-password) cmd_hash_password "$@" ;;
 
@@ -1032,12 +1289,19 @@ main() {
     move-content) cmd_move_content "$@" ;;
     import-content) cmd_import_content "$@" ;;
 
-    get-account-id) cmd_get_account_id ;;
+    get-account-id) cmd_get_account_id "$@" ;;
     get-account) cmd_get_account "$@" ;;
-    whoami) cmd_whoami ;;
+    whoami) cmd_whoami "$@" ;;
     reset-token) cmd_reset_token "$@" ;;
 
-    ""|help|-h|--help) usage ;;
+    ""|help)
+      require_exact_args 0 "help" "$#"
+      usage
+      ;;
+    version)
+      require_exact_args 0 "version" "$#"
+      say "gofile.sh v$VERSION"
+      ;;
     *) die "Unknown command: $cmd (run: $0 --help)" ;;
   esac
 }
