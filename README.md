@@ -2,9 +2,9 @@
 
 A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), manage folders and content, search, create direct links, and handle account actions from your terminal.
 
-> Uploads default to Gofile’s **global upload endpoint**, and the CLI can reuse the returned `folderId`/`guestToken` to keep multiple uploads in the same folder automatically.
+> Uploads default to Gofile’s **global upload endpoint**, and the CLI can reuse the returned `parentFolder`/`guestToken` to keep multiple uploads in the same folder automatically.
 
-> The Gofile API is currently in beta. Most API operations require a token, and some require a Premium account; availability is controlled by Gofile.
+> The Gofile API is currently in beta ([reference](https://gofile.io/api)). Most operations require a token. Uploading, creating folders, updating and deleting content work with any account (including guests); listing (`get-content`, `ls`), `search-content`, `copy-content`, `move-content`, `import-content` and direct links require a Premium account.
 
 ---
 
@@ -52,10 +52,15 @@ A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload f
 
 - **Direct links improvements**
   - Create/update direct links with IP/domain allowlists, auth pairs, **and domainsBlocked**.
+  - Updates keep omitted restrictions; `none` removes one.
+
+- **Listing options**
+  - Pagination, sorting, filtering and nested depth for `get-content` / `ls`; creation-time range for `search-content`.
 
 - **Better output and error handling**
   - Default pretty JSON output; switch to raw/compact when needed.
-  - Fails clearly on invalid options, network failures, HTTP errors, and API errors.
+  - Fails clearly on invalid options, network failures, HTTP errors, and API errors, with a hint for common API statuses (`error-token`, `error-notPremium`, `error-rateLimit`, ...).
+  - Warns when a share code is passed where the API needs a content UUID.
   - Configurable connect and total request timeouts.
 
 - **Quality checks**
@@ -174,19 +179,21 @@ Usage:
 ### Servers
 
 * `get-servers [zone]` (alias: `servers`)
-  Get available servers. Optional zone: `eu` | `na`
+  Get available storage servers. Optional zone: `eu` | `na`.
+  This legacy endpoint still responds but is no longer part of the official API reference; uploads do not need it.
 
 ---
 
 ### Upload
 
-* `upload <file...> [--folder <folderIdOrUrl>] [--region <region>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--allow-custom-auth] [--progress] [--json]`
+* `upload <file...> [--folder <folderId>] [--region <region>] [--zone eu|na] [--server storeX] [--url <uploadUrl>] [--allow-custom-auth] [--progress] [--json]`
 
   Notes:
 
   * Uses the **global upload endpoint** by default.
   * If `--folder` is omitted, the CLI reuses the folder returned by the first upload when uploading multiple files.
-  * Supported regions: `eu-par`, `na-phx`, `ap-sgp`, `ap-hkg`, `ap-tyo`, `sa-sao`.
+  * `--folder` takes the destination folder **UUID** (share codes are not accepted for uploads).
+  * Supported regions: `eu-par`, `na-phx`, `na-nyc`, `ap-sgp`, `ap-hkg`, `ap-tyo`, `ap-syd`, `sa-sao`.
   * `--zone eu|na` remains available as an alias for `--region eu-par|na-phx`.
   * `--server` uses the legacy storage-server endpoint.
   * `--region`, `--zone`, `--server`, and `--url` are mutually exclusive.
@@ -199,38 +206,66 @@ Usage:
 
 ### Folders & contents
 
-* `create-folder <parentFolderIdOrUrl> [folderName] [--public true|false]` (alias: `mkdir`)
-* `ls <folderIdOrUrl> [--password <pw> | --password-hash <sha256hex>] [--json]`
-* `get-content <folderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
-* `search-content <folderIdOrUrl> <searchString> [--password <pw> | --password-hash <sha256hex>]` (alias: `search`)
-* `update-content <contentIdOrUrl> <attribute> <newValue>`
+* `create-folder <parentFolderId> [folderName] [--public true|false]` (alias: `mkdir`)
+* `ls <idOrCodeOrUrl> [read options] [--json]`
+* `get-content <idOrCodeOrUrl> [read options]`
+* `search-content <idOrCodeOrUrl> <searchString> [--password <pw> | --password-hash <sha256hex>] [--created-from <unix>] [--created-to <unix>]` (alias: `search`)
+* `update-content <contentId> <attribute> <newValue> [--delete-after-expiry] [--no-hash]`
 * `delete-content <contentIdsCsv>` (alias: `rm`)
-* `copy-content <contentsIdCsv> <destFolderIdOrUrl> [--password <pw> | --password-hash <sha256hex>]`
-* `move-content <contentsIdCsv> <destFolderIdOrUrl>`
+* `copy-content <contentsIdCsv> <destFolderId> [--password <pw> | --password-hash <sha256hex>]`
+* `move-content <contentsIdCsv> <destFolderId>`
 * `import-content <contentsIdCsv> [--password <pw> | --password-hash <sha256hex>]`
 
-> Tip: For most commands you can pass either a **content ID** or a **share URL** like `https://gofile.io/d/AbCdEf`, the CLI extracts the ID automatically.
+Read options for `get-content` and `ls`:
+
+| Option | Meaning |
+| --- | --- |
+| `--password <pw>` / `--password-hash <sha256hex>` | Password of a protected folder |
+| `--page <n>`, `--page-size <n>` | Pagination (totals are returned in `metadata`) |
+| `--sort-field <field>` | `createTime` (default), `name`, `size`, `downloads`, `mimetype` |
+| `--sort-direction asc\|desc` | Sort order (`1` / `-1` are accepted too) |
+| `--filter <text>` | Case-insensitive substring filter on child names and tags |
+| `--max-depth <1-16>` | Depth of nested children (default 1) |
+
+Attributes for `update-content`:
+
+| Attribute | Applies to | Value |
+| --- | --- | --- |
+| `name` | files & folders | New name (max 255 characters) |
+| `description` | folders | Text, max 2,000 characters; `""` removes it |
+| `tags` | files & folders | Comma-separated tags; `""` removes them |
+| `public` | folders | `true` / `false` |
+| `password` | folders | 4–100 characters; `""` removes it |
+| `expiry` | folders | Unix timestamp; `""` removes it |
+| `modTime` | files & folders | Unix timestamp |
+
+* The password is stored as its SHA-256 hash, which is what `--password` sends when reading the folder. Use `--no-hash` to send the value unchanged.
+* On Premium accounts an expired folder is kept unless `--delete-after-expiry` is passed. On guest/standard accounts an expired folder is **permanently deleted** with everything inside it.
+
+> Tip: content IDs are UUIDs. `get-content`, `ls` and `search-content` also accept a share code or a share URL like `https://gofile.io/d/AbCdEf`. Every command that modifies content needs the UUID; the CLI warns when it gets something else.
 
 ---
 
 ### Direct links
 
-* `create-direct-link <contentIdOrUrl> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
-* `update-direct-link <contentIdOrUrl> <directLinkId> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
-* `delete-direct-link <contentIdOrUrl> <directLinkId>`
+* `create-direct-link <contentId> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
+* `update-direct-link <contentId> <directLinkId> [expireTime] [sourceIpsAllowedCsv] [domainsAllowedCsv] [authCsv] [domainsBlockedCsv]`
+* `delete-direct-link <contentId> <directLinkId>`
 
-> When updating a direct link, Gofile removes restrictions omitted from the request. Pass every restriction you want to keep.
+> Pass `""` to skip a positional field. When updating, skipped fields keep their current value; pass `none` to remove a restriction (for `expireTime`, `none` means "never expires").
 
 ---
 
 ### Account
 
+* `create-account [email]`
+  Without an email: creates a guest account and prints its token (save it, it is the only way back in). With an email: creates a standard account and Gofile emails a sign-in link. No token is sent with this request.
 * `get-account-id`
 * `get-account <accountId>`
 * `whoami`
   Prints account id + root folder id (if available)
 * `reset-token <accountId>`
-  Invalidates your token and triggers a new one (sent via Gofile email)
+  Invalidates your token and triggers a new one (sent via Gofile email). Never use it on a guest account: the new token cannot be delivered and the account is lost.
 
 ---
 
@@ -259,7 +294,7 @@ Usage:
 ### 4) Upload to a specific folder
 
 ```bash
-./gofile.sh upload "./video.mp4" --folder MyFolderId
+./gofile.sh upload "./video.mp4" --folder <folderUuid>
 ```
 
 ### 5) Regional upload (optional)
@@ -276,6 +311,7 @@ Usage:
 
 ```bash
 ./gofile.sh ls https://gofile.io/d/AbCdEf
+./gofile.sh ls https://gofile.io/d/AbCdEf --sort-field name --sort-direction asc --page-size 100
 ```
 
 ### 7) Search with spaces (URL-encoded safely)
@@ -296,7 +332,17 @@ Usage:
 ### 9) Create a direct link with restrictions
 
 ```bash
-./gofile.sh create-direct-link MyFileId 1704067200 "192.168.1.10" "example.com" "alice:secret" "bad.com"
+./gofile.sh create-direct-link <fileUuid> 1786051200 "203.0.113.10" "example.com" "alice:secret" "bad.com"
+# later: drop the IP allowlist and the expiry, keep everything else
+./gofile.sh update-direct-link <fileUuid> <directLinkId> none none
+```
+
+### 10) Protect a folder and set an expiry
+
+```bash
+./gofile.sh update-content <folderUuid> password "secret"
+./gofile.sh update-content <folderUuid> expiry 1786051200
+./gofile.sh update-content <folderUuid> password ""   # remove the password
 ```
 
 ---
