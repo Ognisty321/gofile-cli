@@ -48,7 +48,7 @@ help_config="$TMP_DIR/help-config"
 GOFILE_CONFIG_DIR="$help_config" bash "$SCRIPT" --help >/dev/null
 [[ ! -e "$help_config" ]] || fail "--help created a config directory"
 
-[[ "$(bash "$SCRIPT" --version)" == "gofile.sh v2.2.0" ]] || fail "unexpected version output"
+[[ "$(bash "$SCRIPT" --version)" == "gofile.sh v2.3.0" ]] || fail "unexpected version output"
 [[ "$(bash "$SCRIPT" hash-password abc)" == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ]] ||
   fail "SHA-256 output is incorrect"
 
@@ -217,6 +217,141 @@ fi
 GOFILE_TOKEN="token" bash "$SCRIPT" create-account jane@example.com >/dev/null
 load_curl_args
 curl_payload | jq -e '.email == "jane@example.com"' >/dev/null || fail "create-account did not send the email"
+
+# download (official API, Premium only)
+MOCK_DIR="$TMP_DIR/mock"
+mkdir -p "$MOCK_DIR/files"
+export MOCK_DIR
+printf 'hello\n' >"$MOCK_DIR/files/a.txt"
+printf 'world\n' >"$MOCK_DIR/files/b.txt"
+printf 'second page\n' >"$MOCK_DIR/files/page2.txt"
+printf 'evil\n' >"$MOCK_DIR/files/evil.txt"
+
+mock_file_entry() {
+  # mock_file_entry NAME LINK SOURCE_FILE
+  jq -n --arg name "$1" --arg link "$2" --arg md5 "$(md5sum <"$3" | awk '{print $1}')" \
+    --argjson size "$(wc -c <"$3")" \
+    '{id: $name, type: "file", name: $name, link: $link, md5: $md5, size: $size}'
+}
+
+jq -n --argjson a "$(mock_file_entry a.txt https://store-1.gofile.io/redirect/a.txt "$MOCK_DIR/files/a.txt")" \
+  '{status: "ok", data: {id: "ROOT", type: "folder", name: "Root Folder",
+    children: {A: $a, S: {id: "SUB", type: "folder", name: "sub"}}},
+    metadata: {page: 1, totalPages: 2, hasNextPage: true}}' >"$MOCK_DIR/ROOT.1.json"
+jq -n --argjson p "$(mock_file_entry page2.txt https://store-1.gofile.io/files/page2.txt "$MOCK_DIR/files/page2.txt")" \
+  '{status: "ok", data: {id: "ROOT", type: "folder", name: "Root Folder", children: {P: $p}},
+    metadata: {page: 2, totalPages: 2, hasNextPage: false}}' >"$MOCK_DIR/ROOT.2.json"
+jq -n --argjson b "$(mock_file_entry b.txt https://store-2.gofile.io/files/b.txt "$MOCK_DIR/files/b.txt")" \
+  --argjson e "$(mock_file_entry ../evil.txt https://store-2.gofile.io/files/evil.txt "$MOCK_DIR/files/evil.txt")" \
+  '{status: "ok", data: {id: "SUB", type: "folder", name: "sub", children: {B: $b, E: $e}}}' >"$MOCK_DIR/SUB.1.json"
+jq -n --argjson f "$(mock_file_entry c.txt https://store-1.gofile.io/evil/c.txt "$MOCK_DIR/files/a.txt")" \
+  '{status: "ok", data: $f}' >"$MOCK_DIR/REDIR.1.json"
+jq -n --argjson f "$(mock_file_entry d.txt https://store-1.gofile.io/files/a.txt "$MOCK_DIR/files/a.txt")" \
+  '{status: "ok", data: ($f + {md5: "00000000000000000000000000000000"})}' >"$MOCK_DIR/BADMD5.1.json"
+jq -n '{status: "ok", data: {id: "LOCKED", type: "folder", canAccess: false, password: true}}' >"$MOCK_DIR/LOCKED.1.json"
+
+cat >"$TMP_DIR/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+url=""
+page=1
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+  case "${args[$i]}" in
+    -o) out="${args[$((i + 1))]}" ;;
+    page=*) page="${args[$i]#page=}" ;;
+    https://*) url="${args[$i]}" ;;
+  esac
+done
+printf '%s\n' "$@" >>"$MOCK_DIR/calls.log"
+case "$url" in
+  https://api.gofile.io/accounts/getid)
+    printf '{"status":"ok","data":{"id":"acc","tier":"%s"}}\n200' "${MOCK_TIER:-premium}"
+    ;;
+  https://api.gofile.io/contents/*)
+    cat "$MOCK_DIR/${url##*/}.$page.json"
+    printf '\n200'
+    ;;
+  https://store-1.gofile.io/redirect/*)
+    printf 'redirect body' >>"$out"
+    printf '302\thttps://store-2.gofile.io/files/%s' "${url##*/}"
+    ;;
+  https://store-1.gofile.io/evil/*)
+    printf '302\thttps://evil.example.com/%s' "${url##*/}"
+    ;;
+  https://*.gofile.io/files/*)
+    # Like "curl -C -": continue after the bytes that are already there.
+    offset=0
+    if [[ -f "$out" ]]; then
+      offset="$(wc -c <"$out")"
+    fi
+    tail -c "+$((offset + 1))" "$MOCK_DIR/files/${url##*/}" >>"$out"
+    printf '200\t'
+    ;;
+  *) exit 22 ;;
+esac
+EOF
+
+dl_dir="$TMP_DIR/downloads"
+dl_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download "https://gofile.io/d/ROOT" --output "$dl_dir")"
+assert_contains "$dl_output" "Done: 4 downloaded, 0 skipped."
+[[ "$(cat "$dl_dir/Root Folder/a.txt")" == "hello" ]] || fail "download did not follow a Gofile redirect cleanly"
+[[ "$(cat "$dl_dir/Root Folder/sub/b.txt")" == "world" ]] || fail "download did not recurse into a subfolder"
+[[ "$(cat "$dl_dir/Root Folder/page2.txt")" == "second page" ]] || fail "download did not fetch the second page"
+[[ -f "$dl_dir/Root Folder/sub/.._evil.txt" ]] || fail "download did not sanitize a hostile file name"
+[[ ! -e "$dl_dir/Root Folder/evil.txt" ]] || fail "a file name escaped its folder"
+[[ -z "$(find "$dl_dir" -name '*.part*')" ]] || fail "download left partial files behind"
+grep -Fx 'Cookie: accountToken=token' "$MOCK_DIR/calls.log" >/dev/null || fail "download did not send the account token"
+
+dl_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download ROOT --output "$dl_dir")"
+assert_contains "$dl_output" "Done: 0 downloaded, 4 skipped."
+
+# Interrupted downloads resume from the .part file, also across a redirect.
+rm -f "$dl_dir/Root Folder/page2.txt" "$dl_dir/Root Folder/a.txt"
+printf 'second' >"$dl_dir/Root Folder/page2.txt.part"
+printf 'he' >"$dl_dir/Root Folder/a.txt.part"
+dl_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download ROOT --output "$dl_dir")"
+assert_contains "$dl_output" "Done: 2 downloaded, 2 skipped."
+[[ "$(cat "$dl_dir/Root Folder/page2.txt")" == "second page" ]] || fail "download did not resume a partial file"
+[[ "$(cat "$dl_dir/Root Folder/a.txt")" == "hello" ]] || fail "download did not resume across a redirect"
+[[ -z "$(find "$dl_dir" -name '*.part*')" ]] || fail "a resumed download left partial files behind"
+
+# An existing file of a different size is never replaced silently.
+printf 'changed locally\n' >"$dl_dir/Root Folder/page2.txt"
+if GOFILE_TOKEN="token" bash "$SCRIPT" download ROOT --output "$dl_dir" >/dev/null 2>&1; then
+  fail "download replaced an existing file without --overwrite"
+fi
+GOFILE_TOKEN="token" bash "$SCRIPT" download ROOT --output "$dl_dir" --overwrite >/dev/null
+[[ "$(cat "$dl_dir/Root Folder/page2.txt")" == "second page" ]] || fail "--overwrite did not replace the file"
+
+if error_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download REDIR --output "$dl_dir" 2>&1)"; then
+  fail "download followed a redirect to a non-Gofile host"
+fi
+assert_contains "$error_output" "non-Gofile"
+if grep -F 'evil.example.com' "$MOCK_DIR/calls.log" >/dev/null; then
+  fail "download contacted a non-Gofile host"
+fi
+
+if error_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download BADMD5 --output "$dl_dir" 2>&1)"; then
+  fail "download accepted a file with a wrong MD5"
+fi
+assert_contains "$error_output" "MD5 mismatch"
+[[ ! -e "$dl_dir/d.txt" && ! -e "$dl_dir/d.txt.part" ]] || fail "a corrupt download was kept"
+
+if error_output="$(GOFILE_TOKEN="token" bash "$SCRIPT" download LOCKED --output "$dl_dir" 2>&1)"; then
+  fail "download ignored a password gate"
+fi
+assert_contains "$error_output" "password-protected"
+
+if error_output="$(MOCK_TIER="standard" GOFILE_TOKEN="token" bash "$SCRIPT" download ROOT --output "$dl_dir" 2>&1)"; then
+  fail "download ran for a non-Premium account"
+fi
+assert_contains "$error_output" "Premium accounts only"
+if error_output="$(GOFILE_CONFIG_DIR="$TMP_DIR/guest-config" bash "$SCRIPT" --guest download ROOT 2>&1)"; then
+  fail "download ran without a token"
+fi
+assert_contains "$error_output" "Premium accounts only"
 
 # API errors must fail, including an error status delivered with HTTP 200.
 cat >"$TMP_DIR/bin/curl" <<'EOF'

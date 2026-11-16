@@ -1,10 +1,10 @@
 # Gofile CLI (Bash)
 
-A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), manage folders and content, search, create direct links, and handle account actions from your terminal.
+A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload files (single or multiple), download files and whole folders, manage folders and content, search, create direct links, and handle account actions from your terminal.
 
 > Uploads default to Gofile’s **global upload endpoint**, and the CLI can reuse the returned `parentFolder`/`guestToken` to keep multiple uploads in the same folder automatically.
 
-> The Gofile API is currently in beta ([reference](https://gofile.io/api)). Most operations require a token. Uploading, creating folders, updating and deleting content work with any account (including guests); listing (`get-content`, `ls`), `search-content`, `copy-content`, `move-content`, `import-content` and direct links require a Premium account.
+> The Gofile API is currently in beta ([reference](https://gofile.io/api)). Most operations require a token. Uploading, creating folders, updating and deleting content work with any account (including guests); listing (`get-content`, `ls`), `download`, `search-content`, `copy-content`, `move-content`, `import-content` and direct links require a Premium account.
 
 ---
 
@@ -42,9 +42,14 @@ A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload f
   - Validates every input file before the first upload starts.
   - Refuses to send an account token to a non-Gofile custom URL.
 
+- **Downloads (Premium)**
+  - `download` fetches a single file or a folder with all its subfolders.
+  - Resumes interrupted downloads, skips files that are already complete, verifies size and MD5.
+  - Sends your token to `*.gofile.io` hosts only, also when a download redirects.
+
 - **More ergonomic commands**
   - `ls` prints a human-friendly listing of a folder.
-  - Aliases: `servers`, `mkdir`, `rm`, `search`.
+  - Aliases: `servers`, `mkdir`, `rm`, `search`, `dl`.
 
 - **Password hashing support**
   - Some API endpoints accept/require a **SHA-256 hex password hash**; the CLI supports `--password` (hashes for you) and `--password-hash` (use your own).
@@ -76,6 +81,8 @@ A robust Bash CLI (`gofile.sh`) for interacting with the Gofile.io API. Upload f
 3. **jq**
 4. For password hashing (one of):
    - `sha256sum` (GNU), or `shasum` (macOS), or `openssl`
+5. Optional, for MD5 verification of downloads (one of):
+   - `md5sum` (GNU), or `md5` (macOS), or `openssl`
 
 ---
 
@@ -201,6 +208,20 @@ Usage:
 
 * `upload-file <filePath> [folderId] [zoneOrServer]`
   Backwards-compatible wrapper for older usage (prefer `upload` going forward).
+
+---
+
+### Download
+
+* `download <idOrCodeOrUrl> [--output <dir>] [--password <pw> | --password-hash <sha256hex>] [--overwrite] [--progress]` (alias: `dl`)
+
+  Notes:
+
+  * Accepts a content UUID, a share code, or a share URL, for a file or a folder.
+  * A folder is saved as `<dir>/<folderName>/...` including all subfolders; `<dir>` defaults to the current directory.
+  * **Requires the token of a Premium account.** The Gofile API serves content listings to Premium accounts only, so there is no supported way to download through the API as a guest or with a free account; use the link in a browser instead. The CLI checks the account tier first and stops with an explanation.
+  * Partial data is kept in `<name>.part` and the download resumes on the next run. Files that already exist with the expected size are skipped; a file with a different size is left alone unless `--overwrite` is given.
+  * Size and MD5 from the listing are verified after each file (MD5 needs `md5sum`, `md5`, or `openssl`).
 
 ---
 
@@ -343,6 +364,13 @@ Attributes for `update-content`:
 ./gofile.sh update-content <folderUuid> password "secret"
 ./gofile.sh update-content <folderUuid> expiry 1786051200
 ./gofile.sh update-content <folderUuid> password ""   # remove the password
+```
+
+### 11) Download a shared folder (Premium)
+
+```bash
+./gofile.sh download https://gofile.io/d/AbCdEf --output ./downloads --progress
+./gofile.sh download https://gofile.io/d/AbCdEf --password "secret"
 ```
 
 ---

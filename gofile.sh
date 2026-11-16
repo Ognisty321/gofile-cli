@@ -16,7 +16,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 
 # --------------------------------------------------
 # Config (XDG-friendly)
@@ -522,6 +522,15 @@ Moves / copies (Premium):
   move-content <contentsIdCsv> <destFolderId>
   import-content <contentsIdCsv> [--password <plain>] [--password-hash <sha256hex>]
 
+Download (Premium):
+  download <idOrCodeOrUrl> [--output <dir>] [--password <plain> | --password-hash <sha256hex>] [--overwrite] [--progress]
+      - Downloads a file, or a folder with all its subfolders, into <dir>
+        (default: current directory); a folder gets its own subdirectory.
+      - The API serves listings to Premium accounts only; other accounts and
+        guests have to use the link in a browser.
+      - Interrupted downloads resume from <name>.part; complete files are
+        skipped; size and MD5 are verified.
+
 Account:
   create-account [email]     Create a guest account (prints its token), or a
                              standard account when an email is given
@@ -538,6 +547,7 @@ Examples:
   $0 search-content <folderId> "music files"
   $0 create-folder <parentId> "My Folder" --public true
   $0 update-direct-link <contentId> <linkId> none "" "" none
+  $0 download https://gofile.io/d/AbCdEf --output ./downloads --progress
 
 EOF
 }
@@ -1279,6 +1289,314 @@ cmd_import_content() {
   curl_json "POST" "${API_BASE}/contents/import" "$payload" | print_json
 }
 
+# --------------------------------------------------
+# Download
+# --------------------------------------------------
+#
+# Listings come from GET /contents/{contentId}, which the API serves to
+# Premium accounts only. Each file in a listing carries a "link" on a Gofile
+# storage server; it is fetched with the account token.
+
+DL_PASSWORD_HASH=""
+DL_PROGRESS=0
+DL_OVERWRITE=0
+DL_COUNT=0
+DL_SKIPPED=0
+DL_MAX_REDIRECTS=5
+
+# Names come from the API: never let them escape the destination directory.
+safe_filename() {
+  local name="$1"
+  local fallback="$2"
+  name="${name//\//_}"
+  name="${name//\\/_}"
+  name="$(printf '%s' "$name" | tr -d '\000-\037')"
+  case "$name" in
+    ""|.|..) name="$fallback" ;;
+  esac
+  printf '%s' "$name"
+}
+
+file_size() {
+  local bytes
+  bytes="$(wc -c <"$1")"
+  printf '%s' "$((bytes))"
+}
+
+md5_hex_file() {
+  # prints the MD5 hex of a file, or nothing when no tool is available
+  if command -v md5sum >/dev/null 2>&1; then
+    md5sum <"$1" | awk '{print $1}'
+  elif command -v md5 >/dev/null 2>&1; then
+    md5 -q <"$1"
+  elif command -v openssl >/dev/null 2>&1; then
+    openssl dgst -md5 -r <"$1" 2>/dev/null | awk '{print $1}'
+  fi
+}
+
+download_file() {
+  # download_file URL DEST EXPECTED_SIZE EXPECTED_MD5   ("-" = unknown)
+  local url="$1"
+  local dest="$2"
+  local size="$3"
+  local md5="$4"
+
+  if [[ -e "$dest" && "$DL_OVERWRITE" -eq 0 ]]; then
+    if [[ -f "$dest" && "$size" =~ ^[0-9]+$ && "$(file_size "$dest")" -eq "$size" ]]; then
+      say "Skipped (already downloaded): $dest"
+      DL_SKIPPED=$((DL_SKIPPED + 1))
+      return 0
+    fi
+    die "File already exists: $dest (use --overwrite to replace it)"
+  fi
+
+  local dest_dir="."
+  if [[ "$dest" == */* ]]; then
+    dest_dir="${dest%/*}"
+  fi
+  mkdir -p -- "$dest_dir"
+
+  local token
+  token="$(get_token)"
+
+  # Partial data is kept in <name>.part so an interrupted download resumes.
+  local part="${dest}.part"
+  local args=(
+    -f
+    --connect-timeout "$CURL_CONNECT_TIMEOUT"
+    --max-time "$CURL_MAX_TIME"
+    -H "User-Agent: gofile-cli/$VERSION"
+    -o "$part"
+    -C -
+  )
+  if [[ -n "$token" ]]; then
+    args+=(-H "Authorization: Bearer $token" -H "Cookie: accountToken=$token")
+  fi
+  if [[ "$DL_PROGRESS" -eq 1 ]]; then
+    args+=(--progress-bar)
+  else
+    args+=(-sS)
+  fi
+
+  say "Downloading: $dest"
+
+  if [[ -f "$part" && "$size" =~ ^[0-9]+$ && "$(file_size "$part")" -eq "$size" ]]; then
+    debug "download_file: $part is already complete"
+  else
+    # Redirects are followed by hand so the token is only ever sent to Gofile.
+    local current="$url"
+    local hops=0
+    local out code redirect part_size
+    while :; do
+      is_official_gofile_url "$current" || die "Refusing to send your token to a non-Gofile download URL: $current"
+      debug "download_file GET $current"
+      part_size=-1
+      if [[ -f "$part" ]]; then
+        part_size="$(file_size "$part")"
+      fi
+      if ! out="$(curl "${args[@]}" "$current" -w $'%{http_code}\t%{redirect_url}')"; then
+        err "Download failed: $current"
+        return 1
+      fi
+      code="${out%%$'\t'*}"
+      redirect=""
+      if [[ "$out" == *$'\t'* ]]; then
+        redirect="${out#*$'\t'}"
+      fi
+      if [[ "$code" =~ ^3[0-9]{2}$ && -n "$redirect" ]]; then
+        # Drop the body of the redirect response, keeping earlier partial data.
+        if [[ "$part_size" -lt 0 ]]; then
+          rm -f -- "$part"
+        elif [[ -f "$part" && "$(file_size "$part")" -ne "$part_size" ]]; then
+          head -c "$part_size" "$part" >"${part}.tmp"
+          mv -f -- "${part}.tmp" "$part"
+        fi
+        hops=$((hops + 1))
+        (( hops <= DL_MAX_REDIRECTS )) || die "Too many redirects while downloading $url"
+        current="$redirect"
+        continue
+      fi
+      break
+    done
+  fi
+
+  [[ -f "$part" ]] || die "Download produced no data: $url"
+
+  if [[ "$size" =~ ^[0-9]+$ ]]; then
+    local actual_size
+    actual_size="$(file_size "$part")"
+    if [[ "$actual_size" -ne "$size" ]]; then
+      rm -f -- "$part"
+      die "Size mismatch for $dest (expected $size bytes, got $actual_size); the partial file was removed"
+    fi
+  fi
+
+  if [[ "$md5" =~ ^[[:xdigit:]]{32}$ ]]; then
+    local actual_md5
+    actual_md5="$(md5_hex_file "$part")"
+    if [[ -n "$actual_md5" ]]; then
+      local expected_lower actual_lower
+      expected_lower="$(printf '%s' "$md5" | tr '[:upper:]' '[:lower:]')"
+      actual_lower="$(printf '%s' "$actual_md5" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$actual_lower" != "$expected_lower" ]]; then
+        rm -f -- "$part"
+        die "MD5 mismatch for $dest; the partial file was removed"
+      fi
+    fi
+  fi
+
+  mv -f -- "$part" "$dest"
+  DL_COUNT=$((DL_COUNT + 1))
+}
+
+download_tree() {
+  # download_tree CONTENT_ID DEST_DIR IS_ROOT
+  local cid="$1"
+  local dest_dir="$2"
+  local is_root="$3"
+
+  local page=1
+  local resp ctype rows has_next
+  while :; do
+    local -a query=(page "$page" pageSize 100 sortField name sortDirection 1)
+    if [[ -n "$DL_PASSWORD_HASH" ]]; then
+      query+=(password "$DL_PASSWORD_HASH")
+    fi
+    resp="$(curl_json_get_urlencoded "${API_BASE}/contents/${cid}" "${query[@]}")"
+
+    # Access gates are answered with status "ok" and canAccess=false.
+    if printf '%s\n' "$resp" | jq -e '.data.canAccess == false' >/dev/null; then
+      if printf '%s\n' "$resp" | jq -e '.data.password == true' >/dev/null; then
+        if [[ -n "$DL_PASSWORD_HASH" ]]; then
+          die "Wrong password for content $cid"
+        fi
+        die "Content $cid is password-protected; use --password or --password-hash"
+      fi
+      die "Content $cid cannot be accessed (private, expired, or not shared with this account)"
+    fi
+
+    ctype="$(printf '%s\n' "$resp" | jq -r '.data.type // empty')"
+
+    if [[ "$ctype" == "file" ]]; then
+      local f_name f_link f_size f_md5
+      f_name="$(printf '%s\n' "$resp" | jq -r '.data.name // empty')"
+      f_link="$(printf '%s\n' "$resp" | jq -r '.data.link // empty')"
+      f_size="$(printf '%s\n' "$resp" | jq -r '.data.size // "-"')"
+      f_md5="$(printf '%s\n' "$resp" | jq -r '.data.md5 // "-"')"
+      [[ -n "$f_link" ]] || die "The API returned no download link for $cid"
+      download_file "$f_link" "$dest_dir/$(safe_filename "$f_name" "$cid")" "$f_size" "$f_md5"
+      return 0
+    fi
+
+    if [[ "$is_root" -eq 1 && "$page" -eq 1 ]]; then
+      local root_name
+      root_name="$(printf '%s\n' "$resp" | jq -r '.data.name // empty')"
+      dest_dir="$dest_dir/$(safe_filename "$root_name" "$cid")"
+    fi
+    mkdir -p -- "$dest_dir"
+
+    # "-" stands for a missing value: empty TSV fields would collapse on read.
+    rows="$(printf '%s\n' "$resp" | jq -r '
+      def field: if . == null or . == "" then "-" else tostring end;
+      (.data.children // {})
+      | to_entries
+      | map(.value)
+      | .[]
+      | [(.type | field), (.id | field), (.size | field), (.md5 | field), (.link | field), (.name // "")]
+      | @tsv
+    ')"
+
+    local c_type c_id c_size c_md5 c_link c_name
+    while IFS=$'\t' read -r c_type c_id c_size c_md5 c_link c_name; do
+      [[ -n "$c_type" ]] || continue
+      c_name="$(safe_filename "${c_name-}" "$c_id")"
+      case "$c_type" in
+        file)
+          if [[ "$c_link" == "-" ]]; then
+            warn "No download link for '$c_name' (skipped)"
+            continue
+          fi
+          download_file "$c_link" "$dest_dir/$c_name" "$c_size" "$c_md5"
+          ;;
+        folder)
+          download_tree "$c_id" "$dest_dir/$c_name" 0
+          ;;
+      esac
+    done <<< "$rows"
+
+    has_next="$(printf '%s\n' "$resp" | jq -r '.metadata.hasNextPage // false')"
+    [[ "$has_next" == "true" ]] || break
+    page=$((page + 1))
+    (( page <= 100000 )) || die "Too many pages while listing $cid"
+  done
+}
+
+cmd_download() {
+  # download <idOrCodeOrUrl> [--output <dir>] [--password <plain>] [--password-hash <hash>] [--overwrite] [--progress]
+  local usage_text="download <idOrCodeOrUrl> [--output <dir>] [--password <plain> | --password-hash <sha256hex>] [--overwrite] [--progress]"
+  local target=""
+  local out_dir="."
+  local pw_plain=""
+  local pw_hash=""
+
+  DL_PROGRESS=0
+  DL_OVERWRITE=0
+  DL_COUNT=0
+  DL_SKIPPED=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output)
+        require_value "$1" "$#"
+        out_dir="$2"
+        [[ -n "$out_dir" ]] || die "--output requires a non-empty directory"
+        shift 2
+        ;;
+      --password)
+        require_value "$1" "$#"
+        pw_plain="$2"
+        shift 2
+        ;;
+      --password-hash)
+        require_value "$1" "$#"
+        pw_hash="$2"
+        shift 2
+        ;;
+      --overwrite) DL_OVERWRITE=1; shift ;;
+      --progress) DL_PROGRESS=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      -*) die "Unknown download option: $1" ;;
+      *)
+        [[ -z "$target" ]] || die "Usage: $0 $usage_text"
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+  [[ -n "$target" ]] || die "Usage: $0 $usage_text"
+
+  local cid
+  cid="$(extract_id "$target")"
+  DL_PASSWORD_HASH="$(resolve_password_hash "$pw_plain" "$pw_hash")"
+
+  local premium_note="The Gofile API serves content listings to Premium accounts only, so download needs the token of a Premium account. Without one, open the link in a browser."
+  [[ -n "$(get_token)" ]] || die "No API token set. $premium_note"
+
+  local resp_id tier
+  resp_id="$(curl_json "GET" "${API_BASE}/accounts/getid")"
+  tier="$(printf '%s\n' "$resp_id" | jq -r '.data.tier // empty')"
+  if [[ -n "$tier" && "$tier" != "premium" ]]; then
+    die "This account's tier is '$tier'. $premium_note"
+  fi
+
+  out_dir="${out_dir%/}"
+  [[ -n "$out_dir" ]] || out_dir="/"
+
+  download_tree "$cid" "$out_dir" 1
+
+  say "Done: $DL_COUNT downloaded, $DL_SKIPPED skipped."
+}
+
 cmd_create_account() {
   # create-account [email]
   # No token is needed (or sent): an empty body creates a guest account and
@@ -1378,7 +1696,7 @@ main() {
   [[ "$NO_AUTH" -eq 0 || -z "$CLI_TOKEN" ]] || die "--guest and --token cannot be used together"
 
   case "$cmd" in
-    get-servers|servers|upload|upload-file|create-folder|mkdir|update-content|delete-content|rm|get-content|search-content|search|ls|create-direct-link|update-direct-link|delete-direct-link|copy-content|move-content|import-content|create-account|get-account-id|get-account|whoami|reset-token)
+    get-servers|servers|upload|upload-file|create-folder|mkdir|update-content|delete-content|rm|get-content|search-content|search|ls|create-direct-link|update-direct-link|delete-direct-link|copy-content|move-content|import-content|download|dl|create-account|get-account-id|get-account|whoami|reset-token)
       need_cmd curl
       need_cmd jq
       validate_http_settings
@@ -1420,6 +1738,8 @@ main() {
     copy-content) cmd_copy_content "$@" ;;
     move-content) cmd_move_content "$@" ;;
     import-content) cmd_import_content "$@" ;;
+
+    download|dl) cmd_download "$@" ;;
 
     create-account) cmd_create_account "$@" ;;
     get-account-id) cmd_get_account_id "$@" ;;
